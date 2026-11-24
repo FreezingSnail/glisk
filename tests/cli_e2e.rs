@@ -23,7 +23,7 @@ use std::{
 const BIN: &str = env!("CARGO_BIN_EXE_glisk");
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../examples/decision-report.html"
+    "/examples/decision-report.html"
 );
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 

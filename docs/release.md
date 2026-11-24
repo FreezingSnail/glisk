@@ -27,11 +27,15 @@ Build and package:
 ./scripts/package-macos.sh
 ```
 
-The script runs `cargo build --release --locked --manifest-path spike/Cargo.toml`.
-The package name stays `glisk-spike`; `spike/Cargo.toml` declares one binary named
-`glisk`, so `--version` prints `glisk 0.0.0`. No dependency or lockfile revision
-changed. Artifacts are git-ignored; the procedure, example, guide, and evidence
-are checked in.
+The script runs `cargo build --release --locked` at the repository root. The
+root package is `glisk`; `Cargo.toml` declares one binary named `glisk`, so
+`--version` prints `glisk 0.0.0`. Dependency versions are unchanged.
+Artifacts are git-ignored; the procedure, example, guide, and evidence are
+checked in.
+
+The measurements, artifact sizes, and checksums below are the historical
+`glisk-2hp.9` release record from commit `1f69672`. The build used the former
+`spike/` package named `glisk-spike`, before the move to the repository root.
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
@@ -98,7 +102,7 @@ document, not just one anchor.
 Raster pixels and PNG bytes stay viewport-bounded as the document grows; the
 long report painted 119 frames at the same raster size. The terminal owner
 reuses one image ID for every frame and has no delete between frames, checked by
-`spike/tests/terminal_session.rs`; cleanup deletes that image once on exit.
+`tests/terminal_session.rs`; cleanup deletes that image once on exit.
 
 Reproduce:
 
@@ -111,9 +115,10 @@ Reproduce:
 
 ## Output modes, offline behavior, and failures
 
-All commands below are the packaged binary. Full suite:
-`cd spike && cargo test --locked` → **96 passed, 0 failed** across the unit and
-seven integration suites (14 CLI end-to-end tests).
+All commands below are the packaged binary. Historical suite result from the
+spike layout: `cd spike && cargo test --locked` → **96 passed, 0 failed** across
+the unit and seven integration suites (14 CLI end-to-end tests). The current
+root suite is `cargo test --locked`.
 
 | Check | Command/result |
 |---|---|
@@ -129,8 +134,8 @@ seven integration suites (14 CLI end-to-end tests).
 | Broken pipe | `dist/glisk ... --text \| head -1` → exit 0, first line only. |
 | Clean environment | `env -i PATH=/usr/bin:/bin HOME=... dist/glisk ... --text` → heading output, exit 0; `--version` → `glisk 0.0.0`. |
 
-Offline denial is enforced in-process by `spike/src/document.rs` and covered by
-`spike/tests/document_ingest.rs` (CSS import, stylesheet, font, network/file
+Offline denial is enforced in-process by `src/document.rs` and covered by
+`tests/document_ingest.rs` (CSS import, stylesheet, font, network/file
 image, iframe, SVG references, navigation). No OS-level packet trace was taken;
 the fixture demonstrates rendering without external resources, while the tests
 assert each denial path.
@@ -189,7 +194,7 @@ closed their windows, but the terminal stream after exit was not captured.
 
 ```sh
 ./scripts/package-macos.sh
-cd spike && cargo test --locked && cd ..
+cargo test --locked
 ./dist/glisk examples/decision-report.html --text | head -3
 ./dist/glisk examples/decision-report.html --snapshot dist/repro-narrow.png \
   --css-width 420 --css-height 900 --scale 2

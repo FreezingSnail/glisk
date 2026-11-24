@@ -24,7 +24,7 @@ use document::*;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../examples/decision-report.html"
+    "/examples/decision-report.html"
 );
 
 // A valid 1x1 RGBA PNG (67 bytes).

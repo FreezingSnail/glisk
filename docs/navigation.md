@@ -1,7 +1,7 @@
 # Keyboard navigation, fragment jumps, and disclosures
 
-Bead: `glisk-2hp.5` · module: `spike/src/navigation.rs` · tests:
-`spike/tests/navigation.rs` · spec:
+Bead: `glisk-2hp.5` · module: `src/navigation.rs` · tests:
+`tests/navigation.rs` · spec:
 `FEASIBILITY.md#navigation-and-search`
 
 The module makes native fragment links and disclosure summaries operable in the
@@ -11,7 +11,7 @@ the focused disclosure, and reports an unknown fragment without changing the
 view. Focus and disclosure state stay on the live Blitz document, so a viewport
 resize and reflow keep both useful.
 
-The module is wired into the pager by bead `glisk-2hp.8`: `spike/src/main.rs`
+The module is wired into the pager by bead `glisk-2hp.8`: `src/main.rs`
 maps Tab/Shift+Tab/Enter to the [`Navigation`] methods. The integration test
 still includes both modules with `#[path = "../src/viewport.rs"]` and
 `#[path = "../src/navigation.rs"]`.

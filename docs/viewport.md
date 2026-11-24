@@ -1,7 +1,7 @@
 # Viewport painting, scrolling, and resize anchoring
 
-Bead: `glisk-2hp.4` · module: `spike/src/viewport.rs` · tests:
-`spike/tests/viewport.rs` · spec:
+Bead: `glisk-2hp.4` · module: `src/viewport.rs` · tests:
+`tests/viewport.rs` · spec:
 `FEASIBILITY.md#terminal-session-and-viewport`
 
 The viewport owns one live Blitz document and paints the visible rectangle
@@ -11,7 +11,7 @@ disclosures because it never rebuilds the DOM. Geometry is explicit: physical
 pixels, device scale, and the derived CSS viewport are passed in, so the layout
 is testable without a TTY.
 
-The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`. The live
+The module is wired into `src/main.rs` by bead `glisk-2hp.8`. The live
 path replaces the spike's inline load/render/scroll handling. The integration
 test still includes the module with `#[path = "../src/viewport.rs"]`.
 
@@ -155,7 +155,6 @@ change is part of this bead.
 ## Tests
 
 ```
-cd spike
 cargo test --test viewport
 ```
 

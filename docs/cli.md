@@ -1,11 +1,11 @@
 # Glisk CLI and pager integration
 
-Bead: `glisk-2hp.8` · entry point: `spike/src/main.rs` · tests:
-`spike/tests/cli_e2e.rs`
+Bead: `glisk-2hp.8` · entry point: `src/main.rs` · tests:
+`tests/cli_e2e.rs`
 
 The CLI is one local document reader. It accepts one `.htm`/`.html` path or `-`
 for stdin; URL-shaped arguments are rejected before the filesystem is touched.
-The document is read through `spike/src/document.rs` with the default 4 MiB
+The document is read through `src/document.rs` with the default 4 MiB
 input cap, DOM node/depth budgets, and offline resource policy. Text extraction
 and graphics share the same live `BaseDocument`.
 
@@ -57,15 +57,15 @@ plain text.
 
 ## Build and package
 
-The Cargo package remains `glisk-spike` in `spike/`, but the only binary is
-named `glisk` (`[[bin]]` in `spike/Cargo.toml`). Build and assemble the local
+The repository root is the Cargo package `glisk`, and the only binary is
+named `glisk` (`[[bin]]` in `Cargo.toml`). Build and assemble the local
 macOS bundle from the pinned lockfile:
 
 ```sh
 ./scripts/package-macos.sh
 ```
 
-That runs `cargo build --release --locked --manifest-path spike/Cargo.toml`,
+That runs `cargo build --release --locked` at the repository root,
 writes `dist/glisk`, and creates a deterministic
 `dist/glisk-v0-macos-<arch>.tar.gz` with the example, authoring guide, CLI doc,
 and checksums. Artifacts are ignored by git; the procedure and sources are
@@ -74,7 +74,6 @@ checked in.
 ## Tests
 
 ```
-cd spike
 cargo test --test cli_e2e
 ```
 

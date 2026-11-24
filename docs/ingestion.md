@@ -1,6 +1,6 @@
 # Bounded document ingestion
 
-Bead: `glisk-2hp.2` · policy source: `FEASIBILITY.md#offline-authoring-and-resource-limits` · code: `spike/src/document.rs`
+Bead: `glisk-2hp.2` · policy source: `FEASIBILITY.md#offline-authoring-and-resource-limits` · code: `src/document.rs`
 
 This module is the single entry point for document bytes. Glisk displays one
 local `.htm`/`.html` file (or the same bytes from stdin); it is not a web
@@ -72,7 +72,7 @@ without coupling rendering to terminal escape production.
 
 ## Wiring in the CLI
 
-`spike/src/main.rs` declares `mod document;` and sends file and `-` sources
+`src/main.rs` declares `mod document;` and sends file and `-` sources
 through `document::ingest_file` / `ingest_stdin` with the same `Limits::default()`
 before mode selection or alternate-screen entry. The live path re-lays out the
 returned document at terminal geometry; `--text` and automatic fallback use the
@@ -81,7 +81,7 @@ the renderer spike has been removed.
 
 ## Verification
 
-`spike/tests/document_ingest.rs` covers:
+`tests/document_ingest.rs` covers:
 
 - identical documents from the example file and the same bytes through the
   reader-shaped stdin path;

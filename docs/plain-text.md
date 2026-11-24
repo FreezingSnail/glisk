@@ -1,15 +1,15 @@
 # Searchable text and plain output
 
-Bead: `glisk-2hp.6` · module: `spike/src/text.rs` · tests:
-`spike/tests/text_output.rs` · spec: `FEASIBILITY.md#navigation-and-search`
+Bead: `glisk-2hp.6` · module: `src/text.rs` · tests:
+`tests/text_output.rs` · spec: `FEASIBILITY.md#navigation-and-search`
 
 This module is the one semantic walk used for both in-viewer search and
 `glisk report.html --text`. It reads the live Blitz DOM after the bounded
-ingestion path in `spike/src/document.rs` has applied the local-only resource
+ingestion path in `src/document.rs` has applied the local-only resource
 policy. It does not depend on Kitty, terminal capabilities, fonts, paint, or a
 viewport.
 
-The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`: both
+The module is wired into `src/main.rs` by bead `glisk-2hp.8`: both
 explicit `--text` and automatic plain-text fallback call
 `text::extract_plain_text` after bounded ingestion. The integration test still
 includes the module with `#[path = "../src/text.rs"]`.
@@ -104,7 +104,6 @@ cannot reintroduce escape sequences.
 ## Tests
 
 ```
-cd spike
 cargo test --test text_output
 ```
 

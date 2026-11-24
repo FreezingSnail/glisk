@@ -1,7 +1,7 @@
 # Terminal session and Kitty viewport
 
-Bead: `glisk-2hp.3` · module: `spike/src/terminal.rs` · tests:
-`spike/tests/terminal_session.rs` · spec:
+Bead: `glisk-2hp.3` · module: `src/terminal.rs` · tests:
+`tests/terminal_session.rs` · spec:
 `FEASIBILITY.md#terminal-session-and-viewport`
 
 This module is the pager's single terminal owner. It owns TTY identity checks,
@@ -9,7 +9,7 @@ the bounded capability/geometry probe, raw mode, the alternate screen, key
 input, Kitty graphics writes, resize geometry, and cleanup. It does not load or
 paint documents, own the keymap, or write plain-text output.
 
-The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`; the CLI
+The module is wired into `src/main.rs` by bead `glisk-2hp.8`; the CLI
 opens it only after bounded ingestion and mode selection. The integration test
 also includes the module with `#[path = "../src/terminal.rs"]`.
 
@@ -127,7 +127,6 @@ printed after cleanup so they remain on the normal screen.
 ## Tests
 
 ```
-cd spike
 cargo test --test terminal_session
 ```
 

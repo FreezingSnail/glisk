@@ -1,6 +1,12 @@
 # Renderer spike: Blitz + Vello CPU + Kitty in Ghostty
 
-Bead: `glisk-2hp.1` · fixture: `examples/decision-report.html` · prototype: `spike/`
+Bead: `glisk-2hp.1` · fixture: `examples/decision-report.html` · prototype:
+historical `spike/` layout
+
+> Historical record. The measurements, binary size, and original prototype
+> paths below belong to the `glisk-2hp.1` spike build. The source now lives at
+> the repository root; the reproduce commands use the current root layout, but
+> the recorded numbers are not new measurements.
 
 This spike answers one question: can a live Blitz document, rasterized by Vello CPU
 and presented as one viewport-sized Kitty image, carry the reference report inside
@@ -31,7 +37,7 @@ not the tmux pane.
 
 ## Pinned crates
 
-`spike/Cargo.lock` is checked in. Direct pins:
+`Cargo.lock` is checked in. Direct pins:
 
 | Crate | Version | Why |
 |---|---:|---|
@@ -167,6 +173,8 @@ Raw samples: `docs/evidence/snapshot-samples.txt` and `snap-*.metrics`.
 
 ### Binary
 
+Historical spike release binary:
+
 ```
 -rwxr-xr-x  13,057,872 bytes  spike/target/release/glisk   (12.45 MiB)
 ```
@@ -212,19 +220,18 @@ Headless final render (includes the fixed `1230 ms` label):
 Build:
 
 ```sh
-cd spike
 cargo build --release
 ```
 
 Headless frame, narrow and wide:
 
 ```sh
-./target/release/glisk ../examples/decision-report.html \
-  --snapshot ../docs/evidence/narrow-chart.png \
+./target/release/glisk examples/decision-report.html \
+  --snapshot docs/evidence/narrow-chart.png \
   --css-width 420 --css-height 900 --scale 2 --fragment chart
 
-./target/release/glisk ../examples/decision-report.html \
-  --snapshot ../docs/evidence/wide-chart.png \
+./target/release/glisk examples/decision-report.html \
+  --snapshot docs/evidence/wide-chart.png \
   --css-width 1000 --css-height 900 --scale 2 --fragment chart
 ```
 
@@ -232,15 +239,15 @@ Headless interaction/resize assertions (anchor scroll, disclosure open, focus an
 state retained across viewport change):
 
 ```sh
-./target/release/glisk ../examples/decision-report.html --self-test \
-  --metrics ../docs/evidence/self-test.metrics
+./target/release/glisk examples/decision-report.html --self-test \
+  --metrics docs/evidence/self-test.metrics
 ```
 
 Live Ghostty window with deterministic scripted actions and frame dumps:
 
 ```sh
 open -na Ghostty.app --args --font-size=14 --window-width=46 --window-height=17 --title=glisk \
-  -e "$PWD/spike/target/release/glisk" \
+  -e "$PWD/target/release/glisk" \
      "$PWD/examples/decision-report.html" \
      --scripted-actions \
      --dump-dir "$PWD/docs/evidence/ghostty-live" \
@@ -255,7 +262,7 @@ predictable grid. Resize the window manually for a true resize test.
 Interactive manual check (required for acceptance on another machine):
 
 ```sh
-./spike/target/release/glisk examples/decision-report.html
+./target/release/glisk examples/decision-report.html
 ```
 
 1. `Tab` / `Shift+Tab`: focus moves through nav links and both summaries, with a
@@ -270,7 +277,7 @@ Interactive manual check (required for acceptance on another machine):
 Pseudo-terminal framing check:
 
 ```sh
-script -q /dev/null spike/target/release/glisk \
+script -q /dev/null target/release/glisk \
   examples/decision-report.html --once \
   --metrics docs/evidence/pty-live.metrics
 ```

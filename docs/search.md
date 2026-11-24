@@ -1,17 +1,17 @@
 # Pager search, match counts, and next/previous matches
 
-Bead: `glisk-2hp.7` · module: `spike/src/search.rs` · tests:
-`spike/tests/search.rs` · spec: `FEASIBILITY.md#navigation-and-search`
+Bead: `glisk-2hp.7` · module: `src/search.rs` · tests:
+`tests/search.rs` · spec: `FEASIBILITY.md#navigation-and-search`
 
 The module adds the pager search prompt. It edits a query, commits it with
 Enter, matches case-insensitively against the semantic blocks from
-`spike/src/text.rs`, reports the current match count, and moves through matches
+`src/text.rs`, reports the current match count, and moves through matches
 with `n`/`N`, wrapping in both directions. Escape closes the prompt and keeps
 the previous query and position. Matches inside closed disclosures are found
 because extraction includes their bodies, and revealing a match uses the shared
 `Navigation::reveal` hook, which opens hiding disclosures and aligns the block.
 
-The module is wired into the pager by bead `glisk-2hp.8`: `spike/src/main.rs`
+The module is wired into the pager by bead `glisk-2hp.8`: `src/main.rs`
 maps `/`, Enter, Escape, `n`, and `N` to the [`Search`] methods. The integration
 test still includes the text, navigation, viewport, and search modules with
 `#[path = "..."]`.

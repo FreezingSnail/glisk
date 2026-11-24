@@ -1,6 +1,6 @@
 //! Tests for semantic text extraction and plain `--text` rendering.
 //!
-//! Bead `glisk-2hp.6` owns this module and `spike/src/text.rs`. The wiring
+//! Bead `glisk-2hp.6` owns this module and `src/text.rs`. The wiring
 //! beads add `mod text;` to the binary and reuse the same block list for search
 //! and text output.
 
@@ -18,7 +18,7 @@ use text::{BlockKind, extract, extract_plain_text};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../examples/decision-report.html"
+    "/examples/decision-report.html"
 );
 
 fn load(html: &str) -> BaseDocument {

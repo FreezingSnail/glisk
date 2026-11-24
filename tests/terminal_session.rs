@@ -1,5 +1,5 @@
 //! Deterministic pseudo-terminal tests for the terminal owner
-//! (`spike/src/terminal.rs`, bead `glisk-2hp.3`).
+//! (`src/terminal.rs`, bead `glisk-2hp.3`).
 //!
 //! The module is included by path because wiring into `main.rs` belongs to
 //! bead `glisk-2hp.8`. Every test that opens a PTY keeps the master side as a

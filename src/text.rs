@@ -12,7 +12,7 @@
 //! The same block list renders readable plain text and the normalized text a
 //! search matches against. Structural order follows the DOM, not CSS layout.
 //!
-//! Integration note: the wiring beads add `mod text;` to `spike/src/main.rs`
+//! Integration note: the wiring beads add `mod text;` to `src/main.rs`
 //! and call [`extract`] on the ingested document. This module has no terminal
 //! dependency, so it can be tested without Kitty, a graphics terminal, or a
 //! chosen font.
