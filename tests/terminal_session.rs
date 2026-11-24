@@ -296,9 +296,17 @@ fn probe_failure(err: TerminalError) -> ProbeFailureKind {
 /// A syntactically valid PNG header plus filler. The terminal owner only
 /// validates the signature and bounds; rasterization belongs to the renderer.
 fn fake_png(len: usize, marker: u8) -> Vec<u8> {
-    assert!(len >= 8);
+    assert!(len >= 24);
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.resize(len, marker);
+    png[12..16].copy_from_slice(b"IHDR");
+    png
+}
+
+fn fake_png_with_raster(width: u32, height: u32, len: usize, marker: u8) -> Vec<u8> {
+    let mut png = fake_png(len, marker);
+    png[16..20].copy_from_slice(&width.to_be_bytes());
+    png[20..24].copy_from_slice(&height.to_be_bytes());
     png
 }
 
@@ -517,7 +525,12 @@ fn frame_uses_one_image_chunks_and_preserves_cursor() {
 #[test]
 fn multiple_frames_replace_one_image_id() {
     let pty = Pty::open(50, 20);
-    let mut owner = open_with_plan(&pty, probe_config(400), ProbePlan::Success).expect("probe");
+    let mut owner = open_with_plan(
+        &pty,
+        probe_config(400).with_frame_editing(false),
+        ProbePlan::Success,
+    )
+    .expect("probe");
     let image_id = owner.image_id();
     let _ = drain(pty.master);
 
@@ -558,6 +571,71 @@ fn multiple_frames_replace_one_image_id() {
         ),
         1
     );
+}
+
+#[test]
+fn steady_frame_edits_overwrite_base_frame_without_replacing_placement() {
+    let pty = Pty::open(80, 24);
+    let mut owner = open_with_plan(
+        &pty,
+        probe_config(400).with_frame_editing(true),
+        ProbePlan::Success,
+    )
+    .expect("probe");
+    assert!(owner.frame_editing_supported());
+    let image_id = owner.image_id();
+    let _ = drain(pty.master);
+
+    let first = fake_png_with_raster(1280, 736, 9000, 1);
+    let (_, first_wire) = present_captured(&mut owner, pty.master, &first);
+    assert!(contains(&first_wire, b"a=T,f=100"));
+    assert!(contains(&first_wire, b",C=1,c=80,r=23,"));
+
+    let second = fake_png_with_raster(1280, 736, 9000, 2);
+    let (second_stats, second_wire) = present_captured(&mut owner, pty.master, &second);
+    assert!(!contains(&second_wire, b"a=T"));
+    assert!(!contains(&second_wire, b"a=d"));
+    assert!(!contains(&second_wire, b"p=1"));
+    assert!(!contains(&second_wire, b"U=1"));
+    assert!(!contains(&second_wire, b"C=1"));
+    assert!(!contains(&second_wire, b",c=80,r=23"));
+    assert!(contains(
+        &second_wire,
+        format!("\x1b_Ga=f,f=100,i={image_id},r=1,X=1,q=2,m=1;").as_bytes()
+    ));
+    assert_eq!(count(&second_wire, b"\x1b_Ga=f,m=1;"), second_stats.chunks - 2);
+    assert_eq!(count(&second_wire, b"\x1b_Ga=f,m=0;"), 1);
+
+    let payload: Vec<u8> = kitty_payloads(&second_wire)
+        .iter()
+        .flat_map(|payload| payload_data(payload).to_vec())
+        .collect();
+    let decoded = base64_decode(&payload);
+    assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(decoded, second);
+
+    // A changed raster at the same cell geometry must re-place the image.
+    let resized_raster = fake_png_with_raster(1200, 700, 9000, 3);
+    let (_, raster_wire) = present_captured(&mut owner, pty.master, &resized_raster);
+    assert!(contains(&raster_wire, b"a=T,f=100"));
+    assert!(contains(&raster_wire, b",C=1,c=80,r=23,"));
+
+    let same_raster = fake_png_with_raster(1200, 700, 9000, 4);
+    let (_, edit_wire) = present_captured(&mut owner, pty.master, &same_raster);
+    assert!(!contains(&edit_wire, b"a=T"));
+    assert!(contains(&edit_wire, b"a=f,f=100"));
+
+    // A grid resize changes the placement and must bootstrap again.
+    owner.resize(40, 12).expect("resize");
+    let (_, resized_wire) = present_captured(
+        &mut owner,
+        pty.master,
+        &fake_png_with_raster(640, 352, 4000, 5),
+    );
+    assert!(contains(&resized_wire, b"a=T,f=100"));
+    assert!(contains(&resized_wire, b",C=1,c=40,r=11,"));
+
+    owner.finish().expect("finish");
 }
 
 #[test]
@@ -712,4 +790,9 @@ fn geometry_rejects_oversized_raster_before_allocation() {
 fn base64_encode(bytes: &[u8]) -> Vec<u8> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     STANDARD.encode(bytes).into_bytes()
+}
+
+fn base64_decode(bytes: &[u8]) -> Vec<u8> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    STANDARD.decode(bytes).expect("base64 payload")
 }

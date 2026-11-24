@@ -59,10 +59,10 @@ same-terminal check. This is what makes
 | `take_repaint_request()` | True once after a tmux pane becomes visible again; the pager redraws its latest frame. |
 | `reprobe_cell()` | Repeat only the bounded `CSI 16t` query, retaining keys typed meanwhile. In tmux the measured client cell is retained instead. |
 | `poll_input(timeout)` | Returns ordinary key bytes unchanged, consumes late/foreign protocol replies, and reports `0x03` as `interrupt`. A lone Escape is returned as a key after an idle poll. |
-| `present(png)` | One full direct Kitty transmission, or in tmux the wrapped image/virtual placement plus the placeholder grid; a bounded error is returned before any write. |
+| `present(png)` | First frame, changed raster/placement, and recovery use a full `a=T` transmit-and-place. Same-identity frames on a verified frame-editing renderer overwrite base frame 1 with `a=f,r=1,X=1`. tmux placeholder cells are written on the first frame and whenever the grid size changes. Size limits are checked before any write. |
 | `paint_status(text)` | Clears and writes the last row with the cursor preserved; strips escape sequences, C0/C1/DEL, and truncates to the grid width. |
 | `finish()` | Idempotent delete-image (raw or passthrough) + show-cursor + leave-alternate-screen + restore-termios sequence. |
-| `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `probe_report()` | Diagnostics and metrics. Environment values are hints only. |
+| `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `frame_editing_supported()`, `probe_report()` | Diagnostics and metrics. Environment values never choose the mode or geometry; the explicit Ghostty 1.4+ pair is the only frame-editing gate. |
 
 ## Mode outcomes
 
@@ -119,14 +119,39 @@ for both values, matching the design choice not to depend on an outer probe.
 
 Each Kitty graphics command is wrapped as
 `ESC Ptmux; <inner with every ESC doubled> ESC \`. That includes every bounded
-PNG chunk (first chunk `a=T,f=100,i=<id>,p=1,q=2,U=1,c=<cols>,r=<content_rows>`,
-later chunks `m=0|1;<base64>`), the session-image deletion
-(`a=d,d=I,i=<id>,q=2`), and nothing else. Uploads/deletes are quiet (`q=2`).
-Ghostty 1.4 replaces an existing image id and its placements, so every frame
-re-sends the image and its virtual placement before repainting the grid.
+PNG chunk and the session-image deletion (`a=d,d=I,i=<id>,q=2`). Uploads and
+deletes are quiet (`q=2`).
 
-The visible image is **ordinary pane text**: `ESC[2J ESC[H`, one truecolor
-foreground (`38:2:<r>:<g>:<b>`, image id in 24 bits), then
+A full frame transmits and places the image: the first chunk is
+`a=T,f=100,i=<id>,p=1,q=2,U=1,c=<cols>,r=<content_rows>` and later chunks are
+`m=0|1;<base64>`. Re-transmitting the same id with `a=T` makes Ghostty delete
+the old image and all placements at the start of the first chunk, so a visible
+gap can appear during a multi-chunk transfer.
+
+On a verified frame-editing renderer, a steady same-identity frame instead
+overwrites base frame 1 in place: `a=f,f=100,i=<id>,r=1,X=1,q=2` on the first
+chunk and `a=f,m=0|1` on later chunks. `X=1` replaces the base pixels (including
+transparency) rather than blending. The placement and current pixels remain
+visible until the final chunk. A changed raster size, cell placement, or a
+hidden→visible recovery uses the full `a=T` path, which re-establishes the image
+and placement. Because Ghostty treats a new direct `a=T` as a continuation
+while an `a=f` load is pending, recovery first sends a scoped quiet delete
+(`a=d,d=I,i=<id>,q=2`) to abort the partial load, then bootstraps. A failed
+update records the same recovery state, so it is never continued as an edit.
+
+Frame editing is gated deliberately: direct terminals must report
+`TERM_PROGRAM=ghostty` with `TERM_PROGRAM_VERSION` 1.4 or newer, and the tmux
+path relies on detection's single attached Ghostty 1.4+ client. A successful
+basic Kitty graphics query is not treated as proof of frame editing; other
+Kitty-compatible terminals keep the full-image behavior.
+
+While scrolling at a stable grid size the existing tmux placeholder cells are
+retained; rewriting them would clear the pane and flash before the new pixels
+appear.
+
+The visible image is **ordinary pane text**. On the first frame and after a
+grid size change Glisk clears and homes the pane with `ESC[2J ESC[H`, sets one
+truecolor foreground (`38:2:<r>:<g>:<b>`, image id in 24 bits), then writes
 `U+10EEEE` + row diacritic + column diacritic per cell, row by row. tmux clips
 and repaints these cells itself. Cursor motion, styles, the alternate screen,
 and the status row stay pane-local. Image ids mix the process id and clock,
@@ -147,8 +172,10 @@ never 0 or the probe id, and cleanup deletes only that id.
 `refresh_size()` also performs a bounded re-check. A pane is considered visible
 when the session has a client, its window is active, the pane is not dead, and
 it is either unzoomed or the active pane. A hidden→visible transition requests
-one repaint of the latest frame, because `allow-passthrough=on` drops graphics
-for hidden panes. Client cell changes and pane resizes recompute geometry.
+one repaint and forces a full transmit-and-place, because `allow-passthrough=on`
+drops graphics for hidden panes and terminal storage may have been lost. Client
+cell changes and pane resizes recompute geometry and likewise bootstrap a full
+frame.
 
 `q`, Ctrl+C, and handled errors run the same `finish()`: delete the owned image
 through passthrough, show the cursor, leave the pane-local alternate screen, and
@@ -216,7 +243,10 @@ Deterministic pseudo-terminal coverage:
 - shared-budget timeout, explicit graphics negative, malformed reply, missing
   geometry, incomplete reply, with termios restored on every failure;
 - chunk framing, chunk count, payload reconstruction, cursor save/restore;
+- steady frame edits (`a=f`) preserve placement and reconstruct the PNG, while
+  changed raster/geometry and unsupported terminals bootstrap;
 - two frames reusing one image id and no delete between frames;
+- Ghostty version gating for frame editing;
 - status-row placement/sanitization/truncation;
 - resize recomputation and rollback on impossible geometry;
 - cleanup after interrupt and after a handled oversized-frame error;
@@ -230,6 +260,10 @@ Unit tests in `terminal.rs` cover scanner framing and status/geometry helpers.
 - wrapped/quiet Kitty transmission, DCS stripping with passthrough on, and no
   graphics with it off;
 - exact placeholder cell delivery, truecolor foreground, resize redraw;
+- steady scrolling completes `a=f` frame edits without `a=T`/delete/placement
+  replacement or re-emitting placeholders;
+- resize bootstraps `a=T`, and a returning pane aborts any pending edit before
+  re-uploading the image while keeping its placeholder cells;
 - two panes with distinct ids and deletion scoped to one id;
 - the full binary through the tmux path, `q` and Ctrl+C pane restoration;
 - fallbacks for an unsupported client, zero cell geometry, and two attached

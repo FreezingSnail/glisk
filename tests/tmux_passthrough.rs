@@ -414,6 +414,48 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+fn kitty_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::new();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == 0x1b && bytes[index + 1] == b'_' && bytes[index + 2] == b'G' {
+            let start = index + 3;
+            match bytes[start..]
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+            {
+                Some(offset) => {
+                    payloads.push(bytes[start..start + offset].to_vec());
+                    index = start + offset + 2;
+                }
+                None => break,
+            }
+        } else {
+            index += 1;
+        }
+    }
+    payloads
+}
+
+fn payload_data(payload: &[u8]) -> &[u8] {
+    let separator = payload
+        .iter()
+        .position(|byte| *byte == b';')
+        .expect("payload separator");
+    &payload[separator + 1..]
+}
+
+fn decoded_kitty_payload(bytes: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let encoded: Vec<u8> = kitty_payloads(bytes)
+        .iter()
+        .flat_map(|payload| payload_data(payload).to_vec())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("base64 Kitty payload")
+}
+
 fn png_fixture() -> Vec<u8> {
     // 1x1 transparent PNG, enough to exercise the protocol framing.
     const PNG: &[u8] = &[
@@ -627,6 +669,8 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
         return;
     }
     let server = TmuxServer::start("on");
+    // Match the pane height to the outer PTY for the grid size assertions.
+    server.run(&["set-option", "status", "off"]);
     let pty = Pty::open(80, 24);
     let capture = Capture::start(&pty);
     let mut client = server.attach(&pty);
@@ -659,6 +703,10 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
     let started = capture.snapshot();
     let text = String::from_utf8_lossy(&started);
     assert!(
+        contains(&started, b"a=T,f=100"),
+        "the first tmux frame must transmit and place the image"
+    );
+    assert!(
         contains(&started, b"U=1"),
         "the tmux path must request a Unicode-placeholder placement"
     );
@@ -671,6 +719,75 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
         "the pane needs at least one full placeholder grid, saw {} cells",
         text.matches('\u{10EEEE}').count()
     );
+
+    // Scrolling at a stable size replaces the image pixels but must retain the
+    // placeholder cells: re-emitting them would clear and repaint the pane.
+    server.run(&["send-keys", "-t", &pane, "G"]);
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[started.len()..], b"100%")
+        }),
+        "scrolling to the end must update the status row"
+    );
+    let scrolled = capture.snapshot();
+    let scroll_frame = &scrolled[started.len()..];
+    assert!(
+        contains(scroll_frame, b"\x1b_Ga=f,f=100,"),
+        "a same-size scroll must edit base frame 1"
+    );
+    assert!(
+        !contains(scroll_frame, b"\x1b_Ga=T"),
+        "a same-size scroll must not retransmit and replace the image"
+    );
+    assert!(
+        !contains(scroll_frame, b"\x1b_Ga=d"),
+        "a same-size scroll must not delete the image"
+    );
+    assert!(
+        !contains(scroll_frame, b"p=1"),
+        "a same-size scroll must preserve the virtual placement"
+    );
+    assert!(
+        contains(scroll_frame, b"r=1,X=1,"),
+        "frame edits must overwrite base frame 1"
+    );
+    let decoded = decoded_kitty_payload(scroll_frame);
+    assert!(
+        decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the frame-edit chunks must reconstruct a complete PNG"
+    );
+    assert!(
+        !contains(scroll_frame, "\u{10EEEE}".as_bytes()),
+        "scrolling at the same size must retain the placeholder grid"
+    );
+    assert!(!contains(scroll_frame, b"\x1b[2J"));
+    let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
+    assert_eq!(screen.matches('\u{10EEEE}').count(), 80 * 23);
+
+    // A pane resize changes the grid dimensions and must rebuild the cells.
+    pty.resize(72, 20);
+    // SAFETY: the client is the foreground process of this PTY.
+    unsafe { libc::kill(client.id() as libc::pid_t, libc::SIGWINCH) };
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[scrolled.len()..], b",c=72,r=19,")
+        }),
+        "a pane resize must upload an image with the new dimensions"
+    );
+    let resized_frame = &capture.snapshot()[scrolled.len()..];
+    assert!(
+        contains(resized_frame, b"\x1b_Ga=T,f=100"),
+        "a resize must bootstrap and re-place the image"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
+        if screen.matches('\u{10EEEE}').count() == 72 * 19 && screen.contains("glisk |") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the resized grid was incomplete");
+        thread::sleep(Duration::from_millis(25));
+    }
 
     // Quit through the real key path; tmux restores the pane's normal screen
     // (the outer client stays in tmux's own alternate screen), so check the
@@ -698,6 +815,64 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
         Some("tmux")
     );
     let _ = std::fs::remove_file(&metrics);
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+#[test]
+fn returning_to_a_visible_pane_reuploads_the_image_and_keeps_the_grid() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = TmuxServer::start("on");
+    server.run(&["set-option", "status", "off"]);
+    let pty = Pty::open(80, 24);
+    let capture = Capture::start(&pty);
+    let mut client = server.attach(&pty);
+    let pane = server.pane_id();
+    let binary = env!("CARGO_BIN_EXE_glisk");
+    let example = format!(
+        "{}/examples/decision-report.html",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let script = format!("'{binary}' '{example}'; exec sh");
+    server.run(&["respawn-pane", "-k", "-t", &pane, "sh", "-c", &script]);
+    assert!(
+        capture.wait_for(Duration::from_secs(30), |bytes| {
+            contains(bytes, b"glisk |")
+        }),
+        "the live pager never painted its status row"
+    );
+
+    // Leave the window, let at least one visibility sync observe it hidden,
+    // then return. The image must be re-uploaded; the cells stay in place.
+    server.run(&["new-window", "-d", "-t", &server.session, "cat"]);
+    server.run(&["select-window", "-t", &format!("{}:1", server.session)]);
+    thread::sleep(Duration::from_millis(900));
+    let hidden = capture.snapshot();
+
+    server.run(&["select-window", "-t", &format!("{}:0", server.session)]);
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[hidden.len()..], b"\x1b_Ga=T")
+        }),
+        "returning to the pane must re-upload the image"
+    );
+    let returned = &capture.snapshot()[hidden.len()..];
+    let delete = returned
+        .windows(b"\x1b_Ga=d,d=I".len())
+        .position(|window| window == b"\x1b_Ga=d,d=I");
+    let transmit = returned
+        .windows(b"\x1b_Ga=T".len())
+        .position(|window| window == b"\x1b_Ga=T");
+    assert!(
+        matches!((delete, transmit), (Some(delete), Some(transmit)) if delete < transmit),
+        "recovery must abort a partial frame edit before the fresh bootstrap"
+    );
+    let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
+    assert_eq!(screen.matches('\u{10EEEE}').count(), 80 * 23);
 
     let _ = client.kill();
     let _ = client.wait();

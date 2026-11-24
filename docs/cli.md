@@ -137,9 +137,10 @@ asserting image deletion, cursor restoration, and alternate-screen exit.
 `tmux_passthrough` starts an isolated `tmux -S <unique> -f /dev/null` server
 for every test and owns the outer pseudo-terminal; it never contacts the user's
 tmux server. It covers DCS wrapping/unwrapping, passthrough on/off, placeholder
-cell and truecolor preservation, resize redraw, two panes with independent image
-ids, deletion scoped to one id, the full live pager through the tmux path, `q`
-and Ctrl+C pane restoration, and the automatic fallbacks for an unsupported
-client, zero cell geometry, and ambiguous multi-client attachment. A real
+cell and truecolor preservation, steady `a=f` frame edits on scroll, `a=T`
+bootstrap on resize/recovery, two panes with independent image ids, deletion
+scoped to one id, the full live pager through the tmux path, `q` and Ctrl+C pane
+restoration, and the automatic fallbacks for an unsupported client, zero cell
+geometry, and ambiguous multi-client attachment. A real
 Ghostty 1.4 window adds the visible compositor check recorded in
 `docs/evidence/tmux-ghostty.md`.

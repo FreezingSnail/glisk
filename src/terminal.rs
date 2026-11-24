@@ -64,6 +64,17 @@ pub const MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 const PROBE_IMAGE_ID: u32 = 31;
 const MAX_CELL_PX: u16 = 4096;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Viewport raster size from a PNG IHDR chunk. Invalid or synthetic test
+/// payloads fall back to the validated geometry at the call site.
+fn png_raster_size(png: &[u8]) -> Option<(u32, u32)> {
+    if png.len() < 24 || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
 const SAVE_CURSOR: &[u8] = b"\x1b7";
 const RESTORE_CURSOR: &[u8] = b"\x1b8";
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
@@ -217,16 +228,19 @@ pub enum GraphicsHint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentHint {
     pub term_program: Option<String>,
+    pub term_program_version: Option<String>,
     pub term: Option<String>,
     pub kitty_window: bool,
     pub graphics: GraphicsHint,
 }
 
 impl EnvironmentHint {
-    /// Read environment variables. These are hints for diagnostics only; they
-    /// never decide the mode or supply geometry.
+    /// Read environment variables. These never decide the plain/live mode or
+    /// supply geometry; the only feature decision is the explicit Ghostty
+    /// frame-editing gate in [`Self::frame_editing_supported`].
     pub fn detect() -> Self {
         let term_program = env::var("TERM_PROGRAM").ok();
+        let term_program_version = env::var("TERM_PROGRAM_VERSION").ok();
         let term = env::var("TERM").ok();
         let kitty_window = env::var_os("KITTY_WINDOW_ID").is_some();
         let graphics = match (term_program.as_deref(), term.as_deref()) {
@@ -239,11 +253,44 @@ impl EnvironmentHint {
         };
         Self {
             term_program,
+            term_program_version,
             term,
             kitty_window,
             graphics,
         }
     }
+
+    /// True only for a verified Ghostty 1.4+ direct terminal.
+    ///
+    /// A successful basic Kitty query proves drawing support, not animation
+    /// frame editing. Ghostty 1.4.0 implements `a=f` frame overwrite but
+    /// predates Kitty's feature query, so the direct path deliberately gates on
+    /// Ghostty's own `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` contract instead of
+    /// assuming the action from the basic query.
+    pub fn frame_editing_supported(&self) -> bool {
+        matches!(self.graphics, GraphicsHint::Ghostty)
+            && self
+                .term_program_version
+                .as_deref()
+                .and_then(parse_program_version)
+                .is_some_and(|version| version >= MIN_FRAME_EDITING_GHOSTTY)
+    }
+}
+
+/// First Ghostty version with the verified `a=f` existing-frame overwrite path.
+const MIN_FRAME_EDITING_GHOSTTY: (u32, u32) = (1, 4);
+
+fn parse_program_version(value: &str) -> Option<(u32, u32)> {
+    let value = value.trim();
+    let value = value.split(['-', ' ']).next().unwrap_or(value);
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts
+        .next()?
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .parse::<u32>()
+        .ok()?;
+    Some((major, minor))
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +455,9 @@ pub struct TerminalConfig {
     pub max_png_bytes: usize,
     pub max_encoded_bytes: usize,
     pub max_raster_pixels: u32,
+    /// Override the terminal's frame-editing capability. `None` uses the
+    /// verified Ghostty gate for direct terminals and tmux detection for panes.
+    pub frame_editing: Option<bool>,
 }
 
 impl Default for TerminalConfig {
@@ -420,6 +470,7 @@ impl Default for TerminalConfig {
             max_png_bytes: MAX_PNG_BYTES,
             max_encoded_bytes: MAX_ENCODED_BYTES,
             max_raster_pixels: MAX_RASTER_PIXELS,
+            frame_editing: None,
         }
     }
 }
@@ -471,6 +522,12 @@ impl TerminalConfig {
 
     pub fn with_png_limit(mut self, bytes: usize) -> Self {
         self.max_png_bytes = bytes;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_frame_editing(mut self, supported: bool) -> Self {
+        self.frame_editing = Some(supported);
         self
     }
 }
@@ -1092,6 +1149,15 @@ enum Placement {
     Tmux(TmuxPane),
 }
 
+/// Geometry and raster identity established by the last full image upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameIdentity {
+    cols: u16,
+    content_rows: u16,
+    raster_w: u32,
+    raster_h: u32,
+}
+
 pub struct TerminalOwner {
     input_fd: RawFd,
     output_fd: RawFd,
@@ -1116,6 +1182,14 @@ pub struct TerminalOwner {
     tmux_last_sync: Instant,
     /// A pane became visible again; redraw the latest frame once.
     tmux_repaint: bool,
+    /// Columns and content rows of the placeholder cells already in tmux.
+    tmux_grid_size: Option<(u16, u16)>,
+    /// The terminal accepts in-place Kitty frame edits (`a=f,r=1,X=1`).
+    frame_editing: bool,
+    /// Identity of the image and placement established by the last full upload.
+    frame_identity: Option<FrameIdentity>,
+    /// The next frame must be a full transmit-and-place, not a frame edit.
+    force_full_frame: bool,
 }
 
 impl fmt::Debug for TerminalOwner {
@@ -1234,6 +1308,10 @@ impl TerminalOwner {
         }
 
         let image_id = config.image_id;
+        let environment = EnvironmentHint::detect();
+        let frame_editing = config
+            .frame_editing
+            .unwrap_or_else(|| environment.frame_editing_supported());
         Ok(Self {
             input_fd,
             output_fd,
@@ -1243,7 +1321,7 @@ impl TerminalOwner {
             image_id,
             config,
             geometry,
-            environment: EnvironmentHint::detect(),
+            environment,
             probe,
             placement: Placement::Direct,
             keys_pending: pending_keys,
@@ -1254,6 +1332,10 @@ impl TerminalOwner {
             finished: false,
             tmux_last_sync: Instant::now(),
             tmux_repaint: false,
+            tmux_grid_size: None,
+            frame_editing,
+            frame_identity: None,
+            force_full_frame: false,
         })
     }
 
@@ -1312,6 +1394,10 @@ impl TerminalOwner {
             });
         }
 
+        // tmux detection already validated exactly one attached Ghostty 1.4+
+        // client, the version with the verified frame-edit path.
+        let environment = EnvironmentHint::detect();
+        let frame_editing = config.frame_editing.unwrap_or(true);
         Ok(Self {
             input_fd,
             output_fd,
@@ -1320,7 +1406,7 @@ impl TerminalOwner {
             saved_termios: Some(saved),
             config,
             geometry,
-            environment: EnvironmentHint::detect(),
+            environment,
             probe: ProbeReport {
                 cell,
                 elapsed: Duration::ZERO,
@@ -1335,6 +1421,10 @@ impl TerminalOwner {
             finished: false,
             tmux_last_sync: Instant::now(),
             tmux_repaint: false,
+            tmux_grid_size: None,
+            frame_editing,
+            frame_identity: None,
+            force_full_frame: false,
         })
     }
 
@@ -1381,6 +1471,12 @@ impl TerminalOwner {
         &self.environment
     }
 
+    /// Whether this owner will use in-place Kitty frame edits for steady
+    /// same-size frames. Metrics and diagnostics only.
+    pub fn frame_editing_supported(&self) -> bool {
+        self.frame_editing
+    }
+
     pub fn probe_report(&self) -> ProbeReport {
         self.probe
     }
@@ -1404,6 +1500,10 @@ impl TerminalOwner {
                 changed |= refresh.geometry_changed;
                 if refresh.became_visible {
                     self.tmux_repaint = true;
+                    // Graphics output may have been dropped or evicted while
+                    // hidden. Re-establish the image and placement instead of
+                    // editing a frame that may no longer exist.
+                    self.force_full_frame = true;
                 }
             }
             let (cols, rows) = terminal_size(self.output_fd)
@@ -1595,8 +1695,12 @@ impl TerminalOwner {
 
     /// Transmit one viewport PNG and place it above the reserved status row with
     /// the stable image id. The cursor is saved/restored around the write, and
-    /// `C=1` keeps placement from moving it. Every call replaces the previous
-    /// image of the same id.
+    /// `C=1` keeps placement from moving it.
+    ///
+    /// The first frame, a changed raster/placement identity, and a recovery
+    /// request use a full `a=T` transmit-and-place. Same-identity updates on a
+    /// verified frame-editing renderer overwrite base frame 1 with `a=f` so the
+    /// existing placement and pixels stay visible until the final chunk.
     pub fn present(&mut self, png: &[u8]) -> Result<FrameStats, TerminalError> {
         self.ensure_live()?;
         if !png.starts_with(PNG_SIGNATURE) {
@@ -1619,27 +1723,59 @@ impl TerminalOwner {
         }
 
         let geometry = self.geometry;
+        let grid_size = (geometry.cols(), geometry.content_rows());
+        let (raster_w, raster_h) = png_raster_size(png).unwrap_or(geometry.physical_size());
+        let identity = FrameIdentity {
+            cols: geometry.cols(),
+            content_rows: geometry.content_rows(),
+            raster_w,
+            raster_h,
+        };
+        let full_frame =
+            !self.frame_editing || self.force_full_frame || self.frame_identity != Some(identity);
+
         let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(self.config.chunk_bytes).collect();
-        let mut wire = Vec::with_capacity(encoded.len() + chunks.len() * 32 + 16);
-        let mut grid = Vec::new();
+        let mut wire = Vec::with_capacity(encoded.len() + chunks.len() * 48 + 64);
+        let mut grid = None;
+        // A recovery full frame must abort any partially transferred edit
+        // first. Otherwise Ghostty would consume the new a=T as another
+        // continuation of the incomplete a=f load.
+        let abort_pending = full_frame && self.force_full_frame;
         match &self.placement {
             Placement::Direct => {
+                if abort_pending {
+                    wire.extend_from_slice(
+                        format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id).as_bytes(),
+                    );
+                }
                 wire.extend_from_slice(SAVE_CURSOR);
                 wire.extend_from_slice(b"\x1b[H");
                 for (index, chunk) in chunks.iter().enumerate() {
                     let more = usize::from(index + 1 < chunks.len());
-                    if index == 0 {
+                    if full_frame {
+                        if index == 0 {
+                            wire.extend_from_slice(
+                                format!(
+                                    "\x1b_Ga=T,f=100,i={},q=2,C=1,c={},r={},m={more};",
+                                    self.image_id,
+                                    geometry.cols(),
+                                    geometry.content_rows()
+                                )
+                                .as_bytes(),
+                            );
+                        } else {
+                            wire.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                        }
+                    } else if index == 0 {
                         wire.extend_from_slice(
                             format!(
-                                "\x1b_Ga=T,f=100,i={},q=2,C=1,c={},r={},m={more};",
-                                self.image_id,
-                                geometry.cols(),
-                                geometry.content_rows()
+                                "\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};",
+                                self.image_id
                             )
                             .as_bytes(),
                         );
                     } else {
-                        wire.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                        wire.extend_from_slice(format!("\x1b_Ga=f,m={more};").as_bytes());
                     }
                     wire.extend_from_slice(chunk);
                     wire.extend_from_slice(b"\x1b\\");
@@ -1647,54 +1783,96 @@ impl TerminalOwner {
                 wire.extend_from_slice(RESTORE_CURSOR);
             }
             Placement::Tmux(_) => {
-                // Each Kitty command is a separate DCS passthrough. Retransmit
-                // the image and its virtual placement every frame: Ghostty 1.4
-                // replaces an existing image id and its old placements, which
-                // is exactly what the placeholder grid expects.
+                if abort_pending {
+                    wire.extend_from_slice(&tmux::delete_command(self.image_id));
+                }
+                // Each Kitty command is a separate DCS passthrough. Full
+                // frames transmit and place the image; steady same-identity
+                // frames overwrite base frame 1 so the existing virtual
+                // placement and pixels stay visible until the final chunk.
                 for (index, chunk) in chunks.iter().enumerate() {
                     let more = usize::from(index + 1 < chunks.len());
                     let mut inner = Vec::with_capacity(chunk.len() + 80);
-                    if index == 0 {
+                    if full_frame {
+                        if index == 0 {
+                            inner.extend_from_slice(
+                                format!(
+                                    "\x1b_Ga=T,f=100,i={},p=1,q=2,U=1,c={},r={},m={more};",
+                                    self.image_id,
+                                    geometry.cols(),
+                                    geometry.content_rows()
+                                )
+                                .as_bytes(),
+                            );
+                        } else {
+                            inner.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                        }
+                    } else if index == 0 {
                         inner.extend_from_slice(
                             format!(
-                                "\x1b_Ga=T,f=100,i={},p=1,q=2,U=1,c={},r={},m={more};",
-                                self.image_id,
-                                geometry.cols(),
-                                geometry.content_rows()
+                                "\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};",
+                                self.image_id
                             )
                             .as_bytes(),
                         );
                     } else {
-                        inner.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                        inner.extend_from_slice(format!("\x1b_Ga=f,m={more};").as_bytes());
                     }
                     inner.extend_from_slice(chunk);
                     inner.extend_from_slice(b"\x1b\\");
                     wire.extend_from_slice(&tmux::wrap_dcs(&inner));
                 }
-                grid =
-                    tmux::placeholder_grid(self.image_id, geometry.cols(), geometry.content_rows())
-                        .map_err(TerminalError::Tmux)?;
+                // Rewriting the grid clears the pane and can flash. Keep the
+                // existing placeholder cells while scrolling at the same size;
+                // rebuild them after a geometry change so the new dimensions
+                // are covered.
+                if self.tmux_grid_size != Some(grid_size) {
+                    grid = Some(
+                        tmux::placeholder_grid(self.image_id, grid_size.0, grid_size.1)
+                            .map_err(TerminalError::Tmux)?,
+                    );
+                }
             }
         }
 
         // Mark the image as owned before the write: a partial transmission can
         // still register the image, and cleanup must delete it.
         self.image_owned = true;
-        write_fd(self.output_fd, &wire).map_err(|err| TerminalError::Io {
-            op: "viewport frame write",
-            source: err,
-        })?;
-        if !grid.is_empty() {
-            write_fd(self.output_fd, &grid).map_err(|err| TerminalError::Io {
-                op: "placeholder grid write",
+        if let Err(err) = write_fd(self.output_fd, &wire) {
+            // A partial full upload may have removed the old image, and a
+            // partial edit is not a valid continuation. Recover with a fresh
+            // full transmit-and-place on the next frame.
+            self.frame_identity = None;
+            self.force_full_frame = true;
+            return Err(TerminalError::Io {
+                op: "viewport frame write",
                 source: err,
-            })?;
+            });
         }
+        let grid_bytes = match grid {
+            Some(grid) => {
+                if let Err(err) = write_fd(self.output_fd, &grid) {
+                    self.frame_identity = None;
+                    self.force_full_frame = true;
+                    return Err(TerminalError::Io {
+                        op: "placeholder grid write",
+                        source: err,
+                    });
+                }
+                self.tmux_grid_size = Some(grid_size);
+                grid.len()
+            }
+            None => 0,
+        };
+        if full_frame {
+            self.frame_identity = Some(identity);
+        }
+        self.force_full_frame = false;
         Ok(FrameStats {
             png_bytes: png.len(),
             encoded_bytes: encoded.len(),
             chunks: chunks.len(),
-            wire_bytes: wire.len() + grid.len(),
+            wire_bytes: wire.len() + grid_bytes,
         })
     }
 
@@ -1862,6 +2040,28 @@ mod parser_tests {
     fn status_is_sanitized_and_truncated() {
         assert_eq!(sanitize_status("hi\x1b[31mthere\n", 8), "hithere");
         assert_eq!(sanitize_status("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn frame_editing_gate_requires_verified_ghostty() {
+        let hint = |program: &str, version: Option<&str>| EnvironmentHint {
+            term_program: Some(program.to_string()),
+            term_program_version: version.map(str::to_string),
+            term: None,
+            kitty_window: false,
+            graphics: if program.eq_ignore_ascii_case("ghostty") {
+                GraphicsHint::Ghostty
+            } else {
+                GraphicsHint::Kitty
+            },
+        };
+        assert!(hint("ghostty", Some("1.4.0")).frame_editing_supported());
+        assert!(hint("ghostty", Some("1.4.0-2.fc42")).frame_editing_supported());
+        assert!(hint("ghostty", Some("2.0")).frame_editing_supported());
+        assert!(!hint("ghostty", Some("1.3.9")).frame_editing_supported());
+        assert!(!hint("ghostty", None).frame_editing_supported());
+        assert!(!hint("kitty", Some("0.51.0")).frame_editing_supported());
+        assert!(!hint("WezTerm", Some("20240203")).frame_editing_supported());
     }
 
     #[test]
