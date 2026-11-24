@@ -1254,3 +1254,95 @@ fn detection_matches_the_isolated_server_when_ghostty_terminfo_exists() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+#[test]
+fn tmux_pane_picker_opens_returns_and_clears_the_report_image() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = TmuxServer::start("on");
+    server.run(&["set-option", "status", "off"]);
+    let pty = Pty::open(80, 24);
+    let capture = Capture::start(&pty);
+    let mut client = server.attach(&pty);
+    let pane = server.pane_id();
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/picker-tmux")
+        .join(format!("{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create picker root");
+    let report = root.join("report.html");
+    std::fs::write(&report, tmux_watch_html("picker tmux")).expect("write picker report");
+    let metrics = root.join("metrics.txt");
+    let binary = env!("CARGO_BIN_EXE_glisk");
+    let script = format!(
+        "'{binary}' '{}' --metrics '{}'; exec sh",
+        root.display(),
+        metrics.display()
+    );
+    server.run(&["respawn-pane", "-k", "-t", &pane, "sh", "-c", &script]);
+
+    assert!(
+        capture.wait_for(Duration::from_secs(30), |bytes| {
+            contains(bytes, b"Glisk reports") && contains(bytes, b"report.html")
+        }),
+        "the tmux picker never painted its list: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+
+    server.run(&["send-keys", "-t", &pane, "report"]);
+    server.run(&["send-keys", "-t", &pane, "Enter"]);
+    assert!(
+        capture.wait_for(Duration::from_secs(30), |bytes| {
+            contains(bytes, b"\x1b_Ga=T") && contains(bytes, b"glisk |")
+        }),
+        "Enter must open the selected report through the tmux pager: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+
+    let mark = capture.snapshot().len();
+    server.run(&["send-keys", "-t", &pane, "Escape"]);
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[mark..], b"filter: report") && contains(&bytes[mark..], b"\x1b_Ga=d")
+        }),
+        "Escape must clear the report image and return to the preserved filter: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+
+    server.run(&["send-keys", "-t", &pane, "C-c"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
+        if screen.contains("sh-3.2$") && !screen.contains("Glisk reports") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !metrics.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        metrics_value(&metrics, "mode").as_deref(),
+        Some("picker"),
+        "metrics must identify the picker session"
+    );
+    assert_eq!(
+        metrics_value(&metrics, "placement").as_deref(),
+        Some("tmux")
+    );
+    assert_eq!(
+        metrics_value(&metrics, "picker_opens").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        metrics_value(&metrics, "picker_returns").as_deref(),
+        Some("1")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = client.kill();
+    let _ = client.wait();
+}

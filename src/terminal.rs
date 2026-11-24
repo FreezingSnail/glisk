@@ -1882,6 +1882,59 @@ impl TerminalOwner {
         })
     }
 
+    /// Paint a full-screen plain-text frame, one sanitized string per row.
+    /// Used by the report picker between live image sessions. Rows and cells
+    /// are cleared before writing, and the cursor is preserved.
+    pub fn paint_screen(&mut self, lines: &[String]) -> Result<(), TerminalError> {
+        self.ensure_live()?;
+        let cols = self.geometry.cols();
+        let rows = usize::from(self.geometry.rows());
+        let mut sequence = String::from("\x1b7\x1b[H");
+        for row in 0..rows {
+            if row > 0 {
+                sequence.push_str("\r\n");
+            }
+            sequence.push_str("\x1b[2K");
+            if let Some(line) = lines.get(row) {
+                sequence.push_str(&sanitize_status(line, cols));
+            }
+        }
+        sequence.push_str("\x1b[J\x1b8");
+        write_fd(self.output_fd, sequence.as_bytes()).map_err(|err| TerminalError::Io {
+            op: "picker screen write",
+            source: err,
+        })
+    }
+
+    /// Delete the owned viewport image and forget its placement identity, so a
+    /// later [`Self::present`] transmits a full frame. The alternate screen and
+    /// raw-mode session stay open for the picker.
+    pub fn clear_image(&mut self) -> Result<(), TerminalError> {
+        self.ensure_live()?;
+        let mut sequence = Vec::new();
+        if self.image_owned {
+            match &self.placement {
+                Placement::Direct => sequence.extend_from_slice(
+                    format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id).as_bytes(),
+                ),
+                Placement::Tmux(_) => {
+                    sequence.extend_from_slice(&tmux::delete_command(self.image_id))
+                }
+            }
+            self.image_owned = false;
+        }
+        self.frame_identity = None;
+        self.force_full_frame = true;
+        self.tmux_grid_size = None;
+        if sequence.is_empty() {
+            return Ok(());
+        }
+        write_fd(self.output_fd, &sequence).map_err(|err| TerminalError::Io {
+            op: "viewport image delete",
+            source: err,
+        })
+    }
+
     fn enter_screen(output_fd: RawFd) -> Result<(), TerminalError> {
         write_fd(output_fd, ENTER_SCREEN).map_err(|source| {
             // A short write can leave some of the terminal modes enabled.

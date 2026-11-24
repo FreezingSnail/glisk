@@ -26,7 +26,8 @@ Call order for the pager:
 3. Build a [`TerminalConfig`] (defaults are the feasibility values) and call
    `TerminalOwner::open()` or `open_with_config(config)`.
 4. Render a viewport-sized PNG, then call `present(&png)` and `paint_status(text)`
-   after every state change.
+   after every state change. The report picker instead calls
+   `paint_screen(&lines)` for its plain-text list.
 5. On resize, call `refresh_size()`; it returns `Some(Geometry)` only when the
    grid changed. If the font size changed, call `reprobe_cell()` and then
    `resize_with_cell(cols, rows, cell)`.
@@ -36,6 +37,11 @@ Call order for the pager:
 7. Call `finish()` on normal quit, after `interrupt`, and on every handled error
    before printing diagnostics. `Drop` repeats the same cleanup as a backstop
    for early returns and unwinding.
+
+A picker session opens the owner once and keeps it for both screens. After a
+report returns to the list, the caller calls `clear_image()` before painting the
+list again; the alternate screen, raw mode, and input ownership stay with the
+same owner. `finish()` runs only when Glisk exits.
 
 `open` errors before entering the alternate screen. The caller maps every
 `TerminalError::Probe` and `TerminalError::Geometry` to the plain-text path and
@@ -61,6 +67,8 @@ same-terminal check. This is what makes
 | `poll_input(timeout)` | Returns keyboard and SGR mouse bytes unchanged, consumes late/foreign protocol replies, and reports `0x03` as `interrupt`. A lone Escape is returned as a key after an idle poll. |
 | `present(png)` | First frame, changed raster/placement, and recovery use a full `a=T` transmit-and-place. Same-identity frames on a verified frame-editing renderer overwrite base frame 1 with `a=f,r=1,X=1`. tmux placeholder cells are written on the first frame and whenever the grid size changes. Size limits are checked before any write. |
 | `paint_status(text)` | Clears and writes the last row with the cursor preserved; strips escape sequences, C0/C1/DEL, and truncates to the grid width. |
+| `paint_screen(lines)` | Clears and writes a full-screen plain-text frame, one sanitized line per row, with the cursor preserved. Used by the report picker. |
+| `clear_image()` | Deletes the owned image (raw or tmux passthrough), forgets the placement identity and tmux placeholder grid, and forces the next `present` to be a full transmit. Keeps the alternate screen and raw mode open for the picker. |
 | `finish()` | Idempotent delete-image (raw or passthrough) + disable mouse reporting + show-cursor + leave-alternate-screen + restore-termios sequence. Entry requests SGR mouse reports (`?1006h` plus button event tracking `?1000h`) in the same pane output as the alternate screen; tmux options are never changed. |
 | `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `frame_editing_supported()`, `probe_report()` | Diagnostics and metrics. Environment values never choose the mode or geometry; the explicit Ghostty 1.4+ pair is the only frame-editing gate. |
 

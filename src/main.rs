@@ -10,6 +10,7 @@
 
 mod document;
 mod navigation;
+mod picker;
 mod search;
 mod terminal;
 mod text;
@@ -19,7 +20,7 @@ mod watch;
 
 use std::{
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -43,8 +44,9 @@ const SCROLL_STEP: f64 = 40.0;
 #[derive(Parser, Debug)]
 #[command(name = "glisk", about = "Glisk HTML pager", version)]
 struct Args {
-    /// Local .htm/.html file, or `-` to read the document from stdin.
-    input: String,
+    /// Local .htm/.html file, `-` for stdin, or a directory to pick from.
+    /// Omit it to pick reports below the current directory.
+    input: Option<String>,
 
     /// Write plain UTF-8 text instead of opening the live pager.
     #[arg(long)]
@@ -133,6 +135,54 @@ fn main() {
 }
 
 fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
+    match resolve_source(args)? {
+        Source::Document(input) => run_document(args, &input, started),
+        Source::Picker(root) => {
+            // The picker is an interactive list only. Text mode needs a named
+            // report (or stdin); there is no separate text picker.
+            if args.text || !terminal::is_tty(libc::STDOUT_FILENO) {
+                return Err(picker_needs_report_hint());
+            }
+            run_picker(args, root, started)
+        }
+    }
+}
+
+/// What the positional argument selected. A path that is not an existing
+/// directory is treated as a document, so missing-file and URL diagnostics stay
+/// identical to earlier releases.
+enum Source {
+    Document(String),
+    Picker(PathBuf),
+}
+
+fn resolve_source(args: &Args) -> Result<Source, String> {
+    match args.input.as_deref() {
+        None => std::env::current_dir()
+            .map(Source::Picker)
+            .map_err(|err| format!("cannot read current directory: {err}")),
+        Some("-") => Ok(Source::Document("-".to_string())),
+        Some(input) if looks_like_url(input) => Ok(Source::Document(input.to_string())),
+        Some(input) if Path::new(input).is_dir() => Ok(Source::Picker(PathBuf::from(input))),
+        Some(input) => Ok(Source::Document(input.to_string())),
+    }
+}
+
+fn picker_needs_report_hint() -> String {
+    "no report selected; pass a report path for text output (for example: glisk report.html --text)"
+        .to_string()
+}
+
+/// Hidden diagnostics operate on exactly one named document.
+fn required_input(args: &Args) -> Result<&str, String> {
+    args.input
+        .as_deref()
+        .ok_or_else(|| "this mode needs one report path".to_string())
+}
+
+/// Ingest and present one document: unchanged file, stdin, text, and watch
+/// behavior.
+fn run_document(args: &Args, input: &str, started: Instant) -> Result<(), String> {
     // Ingest with a deterministic text viewport first. The live path re-lays
     // out the same live document at terminal geometry after the owner opens.
     //
@@ -141,20 +191,23 @@ fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
     // revision already on screen (including a change between ingest and the
     // first frame) and can skip a metadata-only touch with identical bytes.
     let (ingested, baseline) =
-        if wants_watch(args) && !args.text && terminal::is_tty(libc::STDOUT_FILENO) {
-            let state = watch::path_state(Path::new(&args.input));
+        if wants_watch(args, input) && !args.text && terminal::is_tty(libc::STDOUT_FILENO) {
+            let state = watch::path_state(Path::new(input));
             if matches!(state, watch::PathState::File(_)) {
-                let html = document::read_html_file(&args.input, &Limits::default())
+                let html = document::read_html_file(input, &Limits::default())
                     .map_err(|err| err.to_string())?;
                 let digest = watch::content_digest(html.as_bytes());
                 let ingested = document::open_document(&html, text_viewport(), Limits::default())
                     .map_err(|err| err.to_string())?;
-                (ingested, Some(watch::Baseline { state, digest }))
+                (
+                    ingested,
+                    Some((PathBuf::from(input), watch::Baseline { state, digest })),
+                )
             } else {
-                (ingest_source(&args.input, text_viewport())?, None)
+                (ingest_source(input, text_viewport())?, None)
             }
         } else {
-            (ingest_source(&args.input, text_viewport())?, None)
+            (ingest_source(input, text_viewport())?, None)
         };
 
     if args.text || !terminal::is_tty(libc::STDOUT_FILENO) {
@@ -162,7 +215,16 @@ fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
     }
 
     match TerminalOwner::open_with_config(TerminalConfig::default()) {
-        Ok(owner) => run_pager(args, ingested, baseline, owner, started),
+        Ok(mut owner) => {
+            let result =
+                run_pager_session(args, ingested, baseline, &mut owner, started, true, false);
+            let finish = owner.finish().map_err(terminal_message);
+            match (result, finish) {
+                (Err(err), _) => Err(err),
+                (Ok(_), Err(err)) => Err(err),
+                (Ok(_), Ok(())) => Ok(()),
+            }
+        }
         Err(err) => {
             eprintln!("glisk: graphics unavailable: {err}; using plain text");
             write_plain_text(&ingested.document)
@@ -171,12 +233,12 @@ fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
 }
 
 /// Watching is a live-pager feature for named local files only.
-fn wants_watch(args: &Args) -> bool {
-    !args.no_watch
-        && !args.once
-        && !args.scripted_actions
-        && args.input != "-"
-        && !looks_like_url(&args.input)
+fn wants_watch(args: &Args, input: &str) -> bool {
+    watch_enabled(args) && input != "-" && !looks_like_url(input)
+}
+
+fn watch_enabled(args: &Args) -> bool {
+    !args.no_watch && !args.once && !args.scripted_actions
 }
 
 fn text_viewport() -> BlitzViewport {
@@ -236,6 +298,8 @@ struct Pager {
     metrics: Metrics,
     watcher: Option<watch::Watcher>,
     watch_status: Option<String>,
+    /// Escape returns to the picker instead of doing nothing.
+    back_enabled: bool,
 }
 
 impl Pager {
@@ -249,6 +313,7 @@ impl Pager {
             metrics: Metrics::new(),
             watcher: None,
             watch_status: None,
+            back_enabled: false,
         }
     }
 
@@ -359,7 +424,8 @@ impl Pager {
         args: &Args,
         owner: &mut TerminalOwner,
         started: Instant,
-    ) -> Result<(), String> {
+        write_metrics: bool,
+    ) -> Result<SessionExit, String> {
         self.metrics.push(
             "term_program",
             &std::env::var("TERM_PROGRAM").unwrap_or_default(),
@@ -378,8 +444,10 @@ impl Pager {
             self.run_scripted_actions(args, owner)?;
             self.metrics.push("frames", &self.frames.to_string());
             note_rss(&mut self.metrics);
-            self.metrics.write(args.metrics.as_deref())?;
-            return Ok(());
+            if write_metrics {
+                self.metrics.write(args.metrics.as_deref())?;
+            }
+            return Ok(SessionExit::Quit);
         }
 
         if args.once {
@@ -387,13 +455,15 @@ impl Pager {
             std::thread::sleep(Duration::from_millis(700));
             self.metrics.push("frames", &self.frames.to_string());
             note_rss(&mut self.metrics);
-            self.metrics.write(args.metrics.as_deref())?;
-            return Ok(());
+            if write_metrics {
+                self.metrics.write(args.metrics.as_deref())?;
+            }
+            return Ok(SessionExit::Quit);
         }
 
         let mut last_sample = Instant::now();
         let mut last_frame = last_sample;
-        loop {
+        let exit = loop {
             let timeout = if self.animation_active(owner) {
                 ANIMATION_FRAME_INTERVAL.saturating_sub(last_frame.elapsed())
             } else {
@@ -402,6 +472,7 @@ impl Pager {
             let batch = owner.poll_input(timeout).map_err(terminal_message)?;
             let mut changed = false;
             let mut quit = false;
+            let mut back = false;
             let now = Instant::now();
             if !self.animation_paused {
                 self.view.advance_animation(now.duration_since(last_sample));
@@ -425,12 +496,15 @@ impl Pager {
                     quit = true;
                 } else {
                     for input in parse_input(&batch.bytes) {
-                        changed |= self.handle_input(input, owner.geometry(), &mut quit);
+                        changed |= self.handle_input(input, owner.geometry(), &mut quit, &mut back);
                     }
                 }
             }
             if quit {
-                break;
+                break SessionExit::Quit;
+            }
+            if back {
+                break SessionExit::Back;
             }
             if owner.take_repaint_request() {
                 self.metrics.count("tmux_repaints");
@@ -438,7 +512,12 @@ impl Pager {
             }
 
             if let Some(state) = self.watcher.as_mut().and_then(|watcher| watcher.poll(now)) {
-                match self.reload(&args.input, &state) {
+                let path = self
+                    .watcher
+                    .as_ref()
+                    .map(|watcher| watcher.path().to_path_buf())
+                    .unwrap_or_default();
+                match self.reload(&path, &state) {
                     Ok(reloaded) => {
                         if self.watch_status.take().is_some() {
                             changed = true;
@@ -464,11 +543,14 @@ impl Pager {
                 self.draw(owner, args)?;
                 last_frame = Instant::now();
             }
-        }
+        };
 
         self.metrics.push("frames", &self.frames.to_string());
         note_rss(&mut self.metrics);
-        self.metrics.write(args.metrics.as_deref())
+        if write_metrics {
+            self.metrics.write(args.metrics.as_deref())?;
+        }
+        Ok(exit)
     }
 
     fn animation_active(&self, owner: &TerminalOwner) -> bool {
@@ -478,7 +560,13 @@ impl Pager {
             && self.view.is_animating()
     }
 
-    fn handle_input(&mut self, input: Input, geometry: Geometry, quit: &mut bool) -> bool {
+    fn handle_input(
+        &mut self,
+        input: Input,
+        geometry: Geometry,
+        quit: &mut bool,
+        back: &mut bool,
+    ) -> bool {
         if self.search.is_editing() {
             return match input {
                 Input::Enter => {
@@ -502,6 +590,11 @@ impl Pager {
                 *quit = true;
                 false
             }
+            Input::Escape if self.back_enabled => {
+                *back = true;
+                false
+            }
+            Input::Escape => false,
             Input::Char('j') | Input::Down => self.view.scroll_by(SCROLL_STEP),
             Input::Char('k') | Input::Up => self.view.scroll_by(-SCROLL_STEP),
             Input::Char(' ') | Input::PageDown => self.view.scroll_page(1.0),
@@ -553,7 +646,7 @@ impl Pager {
     /// Open one changed revision through the bounded offline path, map reader
     /// state onto it, and swap only after it can paint. The previous report is
     /// untouched on every failure.
-    fn reload(&mut self, path: &str, state: &watch::PathState) -> Result<bool, String> {
+    fn reload(&mut self, path: &Path, state: &watch::PathState) -> Result<bool, String> {
         if !matches!(state, watch::PathState::File(_)) {
             return Err(match state {
                 watch::PathState::Missing => {
@@ -796,19 +889,33 @@ fn reload_ingest_error(err: &IngestError) -> String {
     format!("reload: {reason} (keeping previous report)")
 }
 
-fn run_pager(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionExit {
+    /// `q`, Ctrl+C, or a hidden one-shot diagnostic ends Glisk.
+    Quit,
+    /// Escape in a report opened from the picker returns to the list.
+    Back,
+}
+
+/// Run one live document session on an owner that stays open. The caller owns
+/// finish/cleanup, so the picker can reuse the same terminal owner between
+/// reports.
+fn run_pager_session(
     args: &Args,
     ingested: IngestedDocument,
-    baseline: Option<watch::Baseline>,
-    mut owner: TerminalOwner,
+    baseline: Option<(PathBuf, watch::Baseline)>,
+    owner: &mut TerminalOwner,
     started: Instant,
-) -> Result<(), String> {
+    write_metrics: bool,
+    back_enabled: bool,
+) -> Result<SessionExit, String> {
     let geometry = owner.geometry();
     let (width, height) = geometry.physical_size();
     let mut pager = Pager::new(ingested.document, width, height, geometry.scale());
+    pager.back_enabled = back_enabled;
     match baseline {
-        Some(baseline) if wants_watch(args) => {
-            pager.watcher = Some(watch::Watcher::new(&args.input, baseline));
+        Some((path, baseline)) if watch_enabled(args) => {
+            pager.watcher = Some(watch::Watcher::new(path, baseline));
             pager.metrics.push("watch", "on");
         }
         _ => pager.metrics.push("watch", "off"),
@@ -846,18 +953,180 @@ fn run_pager(
         .metrics
         .push("document_nodes", &ingested.stats.nodes.to_string());
 
-    if let Err(err) = pager.prepare(args) {
-        let _ = owner.finish();
-        return Err(err);
-    }
+    pager.prepare(args)?;
+    pager.run(args, owner, started, write_metrics)
+}
 
-    let result = pager.run(args, &mut owner, started);
+// ---------------------------------------------------------------------------
+// Report picker
+// ---------------------------------------------------------------------------
+
+fn run_picker(args: &Args, root: PathBuf, started: Instant) -> Result<(), String> {
+    let mut owner = TerminalOwner::open_with_config(TerminalConfig::default()).map_err(|err| {
+        format!(
+            "picker needs a supported interactive terminal ({err}); {}",
+            picker_needs_report_hint()
+        )
+    })?;
+    let mut picker = picker::Picker::new(root);
+    picker.refresh();
+    let mut metrics = Metrics::new();
+    metrics.push("mode", "picker");
+    metrics.push("picker_root", &picker.root().display().to_string());
+    metrics.push("picker_reports", &picker.entry_count().to_string());
+    metrics.push("picker_partial", &picker.partial().to_string());
+    metrics.push("placement", owner.placement_name());
+
+    let result = picker_loop(args, &mut picker, &mut owner, started, &mut metrics);
+    note_rss(&mut metrics);
+    if result.is_ok() {
+        metrics.write(args.metrics.as_deref())?;
+    }
     let finish = owner.finish().map_err(terminal_message);
     match (result, finish) {
         (Err(err), _) => Err(err),
         (Ok(()), Err(err)) => Err(err),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn picker_loop(
+    args: &Args,
+    picker: &mut picker::Picker,
+    owner: &mut TerminalOwner,
+    started: Instant,
+    metrics: &mut Metrics,
+) -> Result<(), String> {
+    loop {
+        draw_picker(picker, owner)?;
+        let mut open = false;
+        loop {
+            let batch = owner
+                .poll_input(Duration::from_millis(100))
+                .map_err(terminal_message)?;
+            let mut changed = false;
+            if owner.refresh_size().map_err(terminal_message)?.is_some() {
+                changed = true;
+            }
+            if let Some(batch) = batch {
+                if batch.interrupt {
+                    return Ok(());
+                }
+                for input in parse_input(&batch.bytes) {
+                    let Some(key) = picker_key(input) else {
+                        continue;
+                    };
+                    let page = usize::from(owner.geometry().rows().saturating_sub(4)).max(1);
+                    match picker.handle(key, page) {
+                        picker::Action::Exit => return Ok(()),
+                        picker::Action::Open => {
+                            open = true;
+                            break;
+                        }
+                        picker::Action::Changed => changed = true,
+                        picker::Action::None => {}
+                    }
+                }
+            }
+            if open {
+                break;
+            }
+            if owner.take_repaint_request() {
+                metrics.count("tmux_repaints");
+                changed = true;
+            }
+            if changed {
+                draw_picker(picker, owner)?;
+            }
+        }
+
+        let Some(path) = picker.selected_path().map(Path::to_path_buf) else {
+            continue;
+        };
+        metrics.count("picker_opens");
+        match open_picker_report(args, &path, owner, started) {
+            Ok(SessionExit::Quit) => return Ok(()),
+            Ok(SessionExit::Back) => {
+                metrics.count("picker_returns");
+                owner.clear_image().map_err(terminal_message)?;
+                picker.refresh();
+            }
+            Err(err) => {
+                owner.clear_image().map_err(terminal_message)?;
+                picker.set_message(short_picker_error(&err));
+                picker.refresh();
+            }
+        }
+    }
+}
+
+fn draw_picker(picker: &mut picker::Picker, owner: &mut TerminalOwner) -> Result<(), String> {
+    let geometry = owner.geometry();
+    let lines = picker.render(geometry.cols(), geometry.rows());
+    owner.paint_screen(&lines).map_err(terminal_message)
+}
+
+/// Recheck the selected path, then ingest it through the same bounded offline
+/// path as a named file. The picker never keeps a report open on failure.
+fn open_picker_report(
+    args: &Args,
+    path: &Path,
+    owner: &mut TerminalOwner,
+    started: Instant,
+) -> Result<SessionExit, String> {
+    let state = watch::path_state(path);
+    if !matches!(state, watch::PathState::File(_)) {
+        return Err(match state {
+            watch::PathState::Missing => "report removed before opening".to_string(),
+            watch::PathState::NotRegular => "report is not a regular file".to_string(),
+            watch::PathState::Unreadable => "report is unreadable".to_string(),
+            watch::PathState::File(_) => unreachable!(),
+        });
+    }
+    let limits = Limits::default();
+    let html = document::read_html_file(path, &limits)
+        .map_err(|err| picker_ingest_error(&err, "cannot open report"))?;
+    let digest = watch::content_digest(html.as_bytes());
+    let ingested = document::open_document(&html, text_viewport(), limits)
+        .map_err(|err| picker_ingest_error(&err, "cannot open report"))?;
+    let baseline = if watch_enabled(args) {
+        Some((path.to_path_buf(), watch::Baseline { state, digest }))
+    } else {
+        None
+    };
+    run_pager_session(args, ingested, baseline, owner, started, false, true)
+}
+
+fn picker_ingest_error(err: &IngestError, prefix: &str) -> String {
+    let reason = match err {
+        IngestError::Read(io) if io.kind() == io::ErrorKind::NotFound => "file missing",
+        IngestError::Read(_) => "cannot read file",
+        IngestError::TooLarge { .. } => "file too large",
+        IngestError::InvalidUtf8 { .. } => "file is not UTF-8",
+        IngestError::NodeBudget { .. } | IngestError::DepthBudget { .. } => "document too complex",
+    };
+    format!("{prefix}: {reason}")
+}
+
+/// Keep picker errors short enough for one status row.
+fn short_picker_error(message: &str) -> String {
+    picker::sanitize_text(message)
+}
+
+fn picker_key(input: Input) -> Option<picker::Key> {
+    Some(match input {
+        Input::Up => picker::Key::Up,
+        Input::Down => picker::Key::Down,
+        Input::PageUp => picker::Key::PageUp,
+        Input::PageDown => picker::Key::PageDown,
+        Input::Home => picker::Key::Home,
+        Input::End => picker::Key::End,
+        Input::Enter => picker::Key::Enter,
+        Input::Escape => picker::Key::Escape,
+        Input::Backspace => picker::Key::Backspace,
+        Input::Char(ch) => picker::Key::Char(ch),
+        _ => picker::Key::Other,
+    })
 }
 
 fn terminal_message(err: TerminalError) -> String {
@@ -1052,7 +1321,7 @@ fn self_test(args: &Args, started: Instant) -> Result<(), String> {
     let (narrow_w, narrow_h) = (840, 1792);
     let (wide_w, wide_h) = (2000, 1792);
     let ingested = ingest_source(
-        &args.input,
+        required_input(args)?,
         BlitzViewport::new(narrow_w, narrow_h, scale as f32, ColorScheme::Dark),
     )?;
     let mut doc = ingested.document;
@@ -1131,7 +1400,7 @@ fn snapshot(args: &Args, path: &str, started: Instant) -> Result<(), String> {
     let height = (args.css_height * args.scale).round() as u32;
     check_viewport(width, height)?;
     let ingested = ingest_source(
-        &args.input,
+        required_input(args)?,
         BlitzViewport::new(width, height, args.scale as f32, ColorScheme::Dark),
     )?;
     let mut doc = ingested.document;
@@ -1167,7 +1436,7 @@ fn scroll_sweep(args: &Args, started: Instant) -> Result<(), String> {
     let height = (args.css_height * args.scale).round() as u32;
     check_viewport(width, height)?;
     let ingested = ingest_source(
-        &args.input,
+        required_input(args)?,
         BlitzViewport::new(width, height, args.scale as f32, ColorScheme::Dark),
     )?;
     let mut metrics = Metrics::new();

@@ -11,6 +11,7 @@ use std::{
     io::{Read, Write},
     os::fd::{FromRawFd, RawFd},
     os::unix::process::CommandExt,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -506,6 +507,16 @@ struct PtyRun {
 
 impl PtyRun {
     fn spawn(args: &[&str], stdin_document: Option<&[u8]>, reply: ProbeReply, term: &str) -> Self {
+        Self::spawn_in(None, args, stdin_document, reply, term)
+    }
+
+    fn spawn_in(
+        cwd: Option<&std::path::Path>,
+        args: &[&str],
+        stdin_document: Option<&[u8]>,
+        reply: ProbeReply,
+        term: &str,
+    ) -> Self {
         let pty = Pty::open(80, 24);
 
         let (stdin_child, stdin_writer) = match stdin_document {
@@ -529,6 +540,9 @@ impl PtyRun {
         let mut command = Command::new(BIN);
         command.args(args);
         command.env("TERM", term);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command.env_remove("TMUX");
         command.env_remove("TMUX_PANE");
         command.stdin(Stdio::from(stdin_child));
@@ -1143,4 +1157,313 @@ fn unknown_terminal_graphics_rejection_falls_back_to_text() {
     let stderr = String::from_utf8_lossy(&run.stderr()).into_owned();
     assert!(stderr.contains("graphics unavailable"), "{stderr}");
     assert!(stderr.contains("unsupported-graphics"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// Report picker
+// ---------------------------------------------------------------------------
+
+const PICKER_TREE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/picker-tree");
+
+/// Runtime reports for live picker tests. The directory lives under Cargo's
+/// target tree so the checked-in fixture tree stays immutable.
+struct ScratchReports {
+    dir: PathBuf,
+}
+
+impl ScratchReports {
+    fn new(name: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/picker-e2e")
+            .join(format!("{}-{stamp}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch picker directory");
+        Self { dir }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    fn write(&self, name: &str, html: &str) {
+        std::fs::write(self.dir.join(name), html).expect("write scratch report");
+    }
+
+    fn remove(&self, name: &str) {
+        std::fs::remove_file(self.dir.join(name)).expect("remove scratch report");
+    }
+}
+
+impl Drop for ScratchReports {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn picker_current_directory_lists_filters_resizes_and_returns() {
+    let timeout = Duration::from_secs(5);
+    let mut run = PtyRun::spawn_in(
+        Some(Path::new(PICKER_TREE)),
+        &[],
+        None,
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+    );
+    assert!(
+        run.wait_for(b"Glisk reports", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    for expected in [
+        b"nested/child.html".as_slice(),
+        b"reports/UPPER.HTML",
+        b"top.htm",
+    ] {
+        assert!(
+            run.wait_for(expected, timeout),
+            "missing {expected:?}: {}",
+            describe_capture(&run.capture)
+        );
+    }
+    let captured = String::from_utf8_lossy(&run.capture.bytes()).into_owned();
+    assert!(!captured.contains(".hidden.html"), "{captured}");
+    assert!(!captured.contains("linked.html"), "{captured}");
+    assert!(!captured.contains("notes.txt"), "{captured}");
+
+    let mark = run.capture.len();
+    run.resize(100, 30);
+    assert!(
+        run.capture.wait_for_after(mark, b"Glisk reports", timeout),
+        "resize must repaint the list: {}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"child");
+    assert!(
+        run.wait_for(b"> nested/child.html", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    run.keys(b"\r");
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.wait_for(b"Tab focus  Enter open", timeout),
+        "the normal report pager must open: {}",
+        describe_capture(&run.capture)
+    );
+
+    let mark = run.capture.len();
+    // A search prompt consumes the first Escape; the second returns to the
+    // picker with the filter and selection intact.
+    run.keys(b"/Chi\x1b\x1b");
+    assert!(
+        run.capture.wait_for_after(mark, b"filter: child", timeout),
+        "return must preserve the filter: {}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"> nested/child.html", timeout),
+        "return must preserve the selection"
+    );
+    assert!(
+        run.capture.wait_for_after(mark, b"\x1b_Ga=d", timeout),
+        "return must clear the report image"
+    );
+
+    run.keys(b"\x1b");
+    assert!(
+        run.wait_for(b"type to filter", timeout),
+        "Escape clears a nonempty filter instead of exiting"
+    );
+    run.keys(b"zzz");
+    assert!(
+        run.wait_for(b"No reports match", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"\x03");
+    let status = run.wait_exit(timeout);
+    assert!(status.success(), "{status:?}");
+    let captured = run.capture.bytes();
+    assert!(
+        captured
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "alternate screen left"
+    );
+    assert!(
+        captured
+            .windows(b"\x1b[?25h".len())
+            .any(|window| window == b"\x1b[?25h"),
+        "cursor restored"
+    );
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn picker_explicit_directory_opens_with_watch_and_recovers_missing_report() {
+    let scratch = ScratchReports::new("watch");
+    scratch.write("report.html", &watch_html("picker alpha"));
+    scratch.write("other.html", &watch_html("picker other"));
+    let root = scratch.path().to_string_lossy().into_owned();
+    let timeout = Duration::from_secs(6);
+    let mut run = PtyRun::spawn(&[&root], None, ProbeReply::GraphicsOk, "xterm-ghostty");
+
+    assert!(
+        run.wait_for(b"report.html", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    run.keys(b"report");
+    assert!(
+        run.wait_for(b"> report.html", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    run.keys(b"\r");
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    let first = run.graphics_frames();
+    scratch.write("report.html", &watch_html("picker beta"));
+    assert!(
+        run.wait_for_graphics_after(first, timeout),
+        "a picker-opened report watches by default: {}",
+        describe_capture(&run.capture)
+    );
+
+    let mark = run.capture.len();
+    run.keys(b"\x1b");
+    assert!(
+        run.capture.wait_for_after(mark, b"filter: report", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.capture.wait_for_after(mark, b"\x1b_Ga=d", timeout),
+        "the report image is cleared before the list is shown"
+    );
+
+    scratch.remove("report.html");
+    run.keys(b"\r");
+    assert!(
+        run.wait_for(b"report removed before opening", timeout),
+        "a report removed after discovery must leave the picker usable: {}",
+        describe_capture(&run.capture)
+    );
+    assert!(run.wait_for(b"Glisk reports", timeout));
+
+    run.keys(b"\x1b");
+    run.keys(b"other\r");
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "a second report opens without stale state: {}",
+        describe_capture(&run.capture)
+    );
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn picker_no_watch_holds_the_opened_revision_and_q_exits() {
+    let scratch = ScratchReports::new("no-watch");
+    scratch.write("report.html", &watch_html("snapshot alpha"));
+    let root = scratch.path().to_string_lossy().into_owned();
+    let timeout = Duration::from_secs(5);
+    let mut run = PtyRun::spawn(
+        &[&root, "--no-watch"],
+        None,
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+    );
+    assert!(run.wait_for(b"report.html", timeout));
+    run.keys(b"report\r");
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    let first = run.graphics_frames();
+    scratch.write("report.html", &watch_html("snapshot beta"));
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        run.graphics_frames(),
+        first,
+        "--no-watch from the picker must not reload: {}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn picker_requests_without_a_terminal_fail_cleanly() {
+    for args in [vec![], vec!["--text"], vec![PICKER_TREE, "--text"]] {
+        let output = command(&args)
+            .current_dir(PICKER_TREE)
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_plain(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("pass a report path"), "{args:?}: {stderr}");
+    }
+
+    let mut run = PtyRun::spawn_in(
+        Some(Path::new(PICKER_TREE)),
+        &[],
+        None,
+        ProbeReply::GraphicsError,
+        "unknown-terminal",
+    );
+    let status = run.wait_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1));
+    let captured = run.capture.bytes();
+    assert!(
+        !captured.windows(8).any(|window| window == b"\x1b[?1049h"),
+        "an unavailable graphics session must not enter the picker screen"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr()).into_owned();
+    assert!(stderr.contains("picker needs a supported"), "{stderr}");
+    assert!(stderr.contains("pass a report path"), "{stderr}");
+}
+
+#[test]
+fn picker_empty_directory_shows_an_empty_state_and_exits() {
+    let empty = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/picker-empty");
+    let mut run = PtyRun::spawn(&[empty], None, ProbeReply::GraphicsOk, "xterm-ghostty");
+    let timeout = Duration::from_secs(5);
+    assert!(
+        run.wait_for(b"No reports found", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    run.keys(b"\x1b");
+    assert!(run.wait_exit(timeout).success());
+    let captured = run.capture.bytes();
+    assert!(
+        captured
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "alternate screen left"
+    );
+    assert!(run.stderr().is_empty());
 }

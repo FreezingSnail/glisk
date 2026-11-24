@@ -3,9 +3,10 @@
 Bead: `glisk-2hp.8` · entry point: `src/main.rs` · tests:
 `tests/cli_e2e.rs`, `tests/tmux_passthrough.rs`
 
-The CLI is one local document reader. It accepts one `.htm`/`.html` path or `-`
-for stdin; URL-shaped arguments are rejected before the filesystem is touched.
-The document is read through `src/document.rs` with the default 4 MiB
+The CLI is one local document reader. It accepts one `.htm`/`.html` path, `-`
+for stdin, or a directory to browse; with no positional argument it browses the
+current directory. URL-shaped arguments are rejected before the filesystem is
+touched. The document is read through `src/document.rs` with the default 4 MiB
 input cap, DOM node/depth budgets, and offline resource policy. Text extraction
 and graphics share the same live `BaseDocument`.
 
@@ -16,15 +17,60 @@ and graphics share the same live `BaseDocument`.
 | `glisk report.html` | Live pager when `stdout` is a TTY and either the direct Kitty/geometry probe or the tmux pane/client check succeeds. The named file is watched and redisplayed when it changes. |
 | `glisk report.html --no-watch` | Same live pager, but this session holds the revision that was opened and never reloads it. |
 | `glisk -` | Same, reading the document bytes from stdin. Keyboard input comes from the terminal behind `stdout`; a pipe on stdin is fine. Stdin is never watched. |
+| `glisk` | Report picker rooted at the current working directory. |
+| `glisk DIR` | Report picker rooted at an existing directory. |
 | `glisk report.html --text` | Plain UTF-8 text from `text::extract_plain_text`; no terminal session, tmux query, graphics, or watch. |
 | Redirected `stdout` | Plain text immediately, without tmux detection or graphics. |
-| Missing TTY, graphics rejection, missing geometry, probe timeout, tmux failure | Plain text; one actionable reason is printed on stderr. |
+| Missing TTY, graphics rejection, missing geometry, probe timeout, tmux failure | Plain text for a named report; one actionable reason is printed on stderr. A picker request fails with a hint to pass a report path instead. |
 | Closed downstream pipe on plain output | Quiet success, exit 0. |
 
 Diagnostics go to stderr. Plain content and terminal graphics go to stdout.
-Usage errors (including no input) exit 2 through `clap`; input, resource-limit,
+Usage errors for unsupported flags exit 2 through `clap`; input, resource-limit,
 render, and I/O failures exit 1. Normal quit, Ctrl+C, and a closed downstream
 pipe exit 0.
+
+There is no separate text picker. Redirected stdout, `glisk --text`, and
+`glisk DIR --text` print a short stderr message asking for a report path and
+emit no escape sequences.
+
+## Report picker
+
+`glisk` and `glisk DIR` discover regular `.htm`/`.html` files (case-insensitive
+suffix) below the selected root. Hidden entries and every symlink are skipped.
+The tree walk, visited directories, depth, and retained list are bounded; a tree
+that exceeds a budget shows `partial` in the header. Only filenames and
+modification metadata are read until a report is chosen. Entries sort newest
+modification first, with the root-relative path as the tie breaker.
+
+The list shows root-relative paths, the current filter, the selected row, and
+the key hints, sized to the pane. Typing filters case-insensitively by relative
+path. Display text is sanitized for control characters and terminal cell width;
+the native path is kept for selection.
+
+| Key | Action |
+|---|---|
+| Up/Down | Move the selection by one row. |
+| Page Up/Page Down | Move by one visible page. |
+| Home/End | First or last match. |
+| Enter | Open the selected report in the normal rich pager. |
+| Backspace | Remove one filter character. |
+| Escape | Clear a nonempty filter; from an unfiltered list, exit. |
+| Ctrl+C | Exit and restore the terminal. |
+
+`j`, `k`, `q`, and other printable keys are filter text in the picker; they only
+have report commands after a report opens.
+
+Enter rechecks the selected path before the bounded offline ingestion. A report
+removed, unreadable, or over budget leaves the list open with a one-line error.
+The report watches by default and honors `--no-watch`. Escape inside a report
+cancels an active search prompt first; a second Escape clears the report image,
+stops its watcher, and returns to the filtered list with the previous selection.
+Returning also refreshes discovery, so newly created reports appear. `q` from a
+report and Ctrl+C exit Glisk. Both screens share one terminal owner, so only one
+of them controls the pane at a time; exit restores the cursor, screen, and
+termios.
+
+Directory navigation, recent history, and a text-mode picker are out of scope.
 
 ## Following a local report
 
@@ -112,8 +158,8 @@ stdin, `--text`, and offline local HTML behavior are unchanged.
 | Tab / Shift+Tab | Move focus among visible fragment links and disclosure summaries. |
 | Enter | Follow the focused fragment or toggle the focused disclosure. |
 | `/`, `n`, `N` | Open search, then next/previous match. |
-| Escape | Cancel the search prompt, preserving the previous query and position. |
-| `q`, Ctrl+C | Finish and restore the terminal. |
+| Escape | Cancel the search prompt, preserving the previous query and position. In a report opened from the picker, Escape returns to the report list. |
+| `q`, Ctrl+C | Finish and restore the terminal. `q` in a picker-opened report exits Glisk. |
 
 Mouse reporting is enabled with the live view and released on quit, Ctrl+C, and
 handled errors. Clicks on the status row, ordinary content, and external links
@@ -156,6 +202,7 @@ checked in.
 ## Tests
 
 ```
+cargo test --bin glisk picker
 cargo test --test cli_e2e
 cargo test --test tmux_passthrough
 ```
@@ -166,6 +213,14 @@ timeout, explicit graphics rejection, missing/URL/invalid/oversized input, and
 a closed stdout pipe. The live test also exercises disclosure activation,
 search inside a closed disclosure, next-match reveal, resize, and quit while
 asserting image deletion, cursor restoration, and alternate-screen exit.
+
+Picker coverage in `cargo test --bin glisk picker` checks nested discovery,
+hidden/symlink exclusions, newest-first ordering, filter and Escape behavior,
+empty/no-match states, cell-width truncation, selection visibility, and bounded
+partial results. The five `picker_*` E2E tests cover both invocations, resize,
+filtered open, an empty root, return with filter and selection preserved, image
+deletion, watch and `--no-watch`, removed-after-discovery recovery, clean
+Ctrl+C/`q`, and non-interactive failure without escape sequences.
 
 `tmux_passthrough` starts an isolated `tmux -S <unique> -f /dev/null` server
 for every test and owns the outer pseudo-terminal; it never contacts the user's

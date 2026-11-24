@@ -153,6 +153,11 @@ impl Watcher {
         self.digest
     }
 
+    /// The one path this watcher observes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Throttled check. Returns a stable candidate revision whose signature
     /// differs from both the accepted revision and the last rejected one.
     pub fn poll(&mut self, now: Instant) -> Option<PathState> {

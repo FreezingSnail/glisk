@@ -14,6 +14,12 @@ cargo build --release --locked
 cat examples/decision-report.html | ./target/release/glisk -
 ```
 
+Run `glisk` with no argument to pick a `.htm`/`.html` report from the current
+directory, or `glisk DIR` to search an explicit tree. Type to filter by
+relative path, move with Up/Down or Page Up/Down, and press Enter to open;
+Escape from a report returns to the same filter and selection, while `q` or
+Ctrl+C exits. Hidden files and symlinks are skipped, and the list is bounded.
+
 Scroll with the wheel or trackpad, and left-click a visible fragment link or
 disclosure summary to follow or toggle it. The full keymap is in
 [`docs/cli.md`](docs/cli.md).
@@ -71,5 +77,6 @@ bounded `data:image/png` assets.
 - [`docs/terminal-session.md`](docs/terminal-session.md) — terminal owner, direct Kitty path, and tmux placement.
 - [`docs/evidence/tmux-ghostty.md`](docs/evidence/tmux-ghostty.md) — live tmux protocol and Ghostty 1.4 evidence.
 - [`docs/evidence/watch-reload.md`](docs/evidence/watch-reload.md) — live reload, recovery, opt-out, and tmux workflow evidence.
+- [`docs/evidence/picker.md`](docs/evidence/picker.md) — report picker discovery, transitions, and terminal evidence.
 - [`docs/release.md`](docs/release.md) — macOS packaging, evidence, and unverified checks.
 - [`docs/renderer-spike.md`](docs/renderer-spike.md) — historical renderer measurements.
