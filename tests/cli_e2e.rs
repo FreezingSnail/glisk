@@ -32,6 +32,10 @@ static PTY_LOCK: Mutex<()> = Mutex::new(());
 fn command(args: &[&str]) -> Command {
     let mut command = Command::new(BIN);
     command.args(args);
+    // These tests emulate the direct-terminal path. Never inherit the tmux
+    // pane that happens to be running the test suite.
+    command.env_remove("TMUX");
+    command.env_remove("TMUX_PANE");
     command
 }
 
@@ -477,6 +481,8 @@ impl PtyRun {
         let mut command = Command::new(BIN);
         command.args(args);
         command.env("TERM", term);
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
         command.stdin(Stdio::from(stdin_child));
         command.stdout(Stdio::from(dup_fd(pty.slave)));
         command.stderr(Stdio::piped());

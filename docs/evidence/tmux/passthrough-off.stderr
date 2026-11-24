@@ -1,0 +1,1 @@
+glisk: graphics unavailable: tmux support passthrough-off: graphics passthrough is off for pane %1; enable it in that pane with `tmux set-option -p allow-passthrough on`; using plain text

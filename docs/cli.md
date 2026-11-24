@@ -1,7 +1,7 @@
 # Glisk CLI and pager integration
 
 Bead: `glisk-2hp.8` · entry point: `src/main.rs` · tests:
-`tests/cli_e2e.rs`
+`tests/cli_e2e.rs`, `tests/tmux_passthrough.rs`
 
 The CLI is one local document reader. It accepts one `.htm`/`.html` path or `-`
 for stdin; URL-shaped arguments are rejected before the filesystem is touched.
@@ -13,17 +13,65 @@ and graphics share the same live `BaseDocument`.
 
 | Invocation | Result |
 |---|---|
-| `glisk report.html` | Live pager when `stdout` is a TTY and the bounded Kitty/geometry probe succeeds. |
-| `glisk -` | Same, reading the document bytes from stdin. Keyboard input comes from the terminal behind `stdout`. |
-| `glisk report.html --text` | Plain UTF-8 text from `text::extract_plain_text`; no terminal session is opened. |
-| Redirected `stdout` | Plain text immediately, without probing graphics. |
-| Missing TTY, graphics rejection, missing geometry, or probe timeout | Plain text; the reason is a stderr diagnostic. |
+| `glisk report.html` | Live pager when `stdout` is a TTY and either the direct Kitty/geometry probe or the tmux pane/client check succeeds. |
+| `glisk -` | Same, reading the document bytes from stdin. Keyboard input comes from the terminal behind `stdout`; a pipe on stdin is fine. |
+| `glisk report.html --text` | Plain UTF-8 text from `text::extract_plain_text`; no terminal session, tmux query, or graphics. |
+| Redirected `stdout` | Plain text immediately, without tmux detection or graphics. |
+| Missing TTY, graphics rejection, missing geometry, probe timeout, tmux failure | Plain text; one actionable reason is printed on stderr. |
 | Closed downstream pipe on plain output | Quiet success, exit 0. |
 
-Diagnostics go to stderr. Plain content and Kitty graphics go to stdout. Usage
-errors (including no input) exit 2 through `clap`; input, resource-limit, render,
-and I/O failures exit 1. Normal quit, Ctrl+C, and a closed downstream pipe exit
-0.
+Diagnostics go to stderr. Plain content and terminal graphics go to stdout.
+Usage errors (including no input) exit 2 through `clap`; input, resource-limit,
+render, and I/O failures exit 1. Normal quit, Ctrl+C, and a closed downstream
+pipe exit 0.
+
+## tmux setup
+
+The pane-scoped opt-in is required; Glisk never changes tmux options:
+
+```sh
+tmux set-option -p allow-passthrough on
+./target/release/glisk examples/decision-report.html
+```
+
+Run that command in each pane that should render (a split does not inherit the
+pane-local option). The verified matrix is one tmux layer, tmux 3.5+ (tested
+3.5a), one attached Ghostty 1.4+ display client, and a visible pane. Glisk reads
+the pane's `TMUX_PANE`, the socket in `TMUX`, the stdout TTY, and these
+read-only tmux values:
+
+- effective pane `allow-passthrough` and `alternate-screen`;
+- tmux version, pane id/type/size/visibility;
+- the single attached client's name, type, cell pixels, control-mode flag, and
+  UTF-8 flag;
+- whether tmux would preserve 24-bit color for the placeholder image id.
+
+The pane PTY supplies rows/columns. The client supplies cell pixels; Glisk does
+not rely on `TERM_PROGRAM`, `TERM`, or an outer `CSI 16t` reply. If the direct
+`xterm-ghostty` check fails, the automatic path prints the reason and writes
+plain text:
+
+| Failure | Diagnostic hint |
+|---|---|
+| `allow-passthrough` off | `tmux set-option -p allow-passthrough on` |
+| `alternate-screen` off | `tmux set-option -p alternate-screen on` |
+| tmux < 3.5 | Upgrade tmux. |
+| client not `xterm-ghostty` / control mode / not UTF-8 | Attach Ghostty 1.4+. |
+| Ghostty < 1.4 or version unresolved-and-invalid | Upgrade Ghostty. |
+| zero cell pixels | The terminal did not report pixel dimensions. |
+| truecolor disabled | Keep Ghostty terminfo or add `xterm-ghostty:Tc`. |
+| more than one attached client | Attach exactly one display client. |
+| stdout is not the pane's TTY | Run Glisk directly in the pane. |
+
+Glisk re-checks visibility and client cell pixels at most every 500 ms and
+re-uploads the latest frame after a pane/window returns to view. Pane resize,
+zoom, font-size changes, scroll/search/disclosure state, and the status row stay
+inside the pane. On `q`, Ctrl+C, or a handled error it deletes only its own image
+and leaves the pane-local alternate screen.
+
+Nested tmux, multiple attached clients, detach/reattach, and remote transports
+are outside the initial supported matrix. Direct Ghostty, redirected stdout,
+stdin, `--text`, and offline local HTML behavior are unchanged.
 
 ## Live keymap
 
@@ -40,8 +88,9 @@ and I/O failures exit 1. Normal quit, Ctrl+C, and a closed downstream pipe exit
 
 Resize is read from the terminal owner's `TIOCGWINSZ` path; the viewport reflows
 with its block anchor, so reading position, focus, and open disclosures survive.
-The search/status row is reserved below the image and sanitized by the terminal
-owner.
+In tmux the client cell pixels and pane visibility are re-read on the bounded
+interval described above. The search/status row is reserved below the image and
+sanitized by the terminal owner.
 
 ## Hidden diagnostic flags
 
@@ -75,6 +124,7 @@ checked in.
 
 ```
 cargo test --test cli_e2e
+cargo test --test tmux_passthrough
 ```
 
 The E2E suite spawns the real binary and covers file/stdin text, redirected
@@ -83,3 +133,13 @@ timeout, explicit graphics rejection, missing/URL/invalid/oversized input, and
 a closed stdout pipe. The live test also exercises disclosure activation,
 search inside a closed disclosure, next-match reveal, resize, and quit while
 asserting image deletion, cursor restoration, and alternate-screen exit.
+
+`tmux_passthrough` starts an isolated `tmux -S <unique> -f /dev/null` server
+for every test and owns the outer pseudo-terminal; it never contacts the user's
+tmux server. It covers DCS wrapping/unwrapping, passthrough on/off, placeholder
+cell and truecolor preservation, resize redraw, two panes with independent image
+ids, deletion scoped to one id, the full live pager through the tmux path, `q`
+and Ctrl+C pane restoration, and the automatic fallbacks for an unsupported
+client, zero cell geometry, and ambiguous multi-client attachment. A real
+Ghostty 1.4 window adds the visible compositor check recorded in
+`docs/evidence/tmux-ghostty.md`.

@@ -13,6 +13,7 @@ mod navigation;
 mod search;
 mod terminal;
 mod text;
+mod tmux;
 mod viewport;
 
 use std::{
@@ -359,6 +360,10 @@ impl Pager {
                     changed = true;
                 }
             }
+            if owner.take_repaint_request() {
+                self.metrics.count("tmux_repaints");
+                changed = true;
+            }
 
             if changed {
                 self.draw(owner, args)?;
@@ -486,6 +491,17 @@ fn run_pager(
     let (width, height) = geometry.physical_size();
     let mut pager = Pager::new(ingested.document, width, height, geometry.scale());
     pager.metrics.push("mode", "live");
+    pager.metrics.push("placement", owner.placement_name());
+    pager
+        .metrics
+        .push("image_id", &owner.image_id().to_string());
+    if let Some(summary) = owner.tmux_summary() {
+        pager.metrics.push("tmux", &summary);
+        pager.metrics.push(
+            "tmux_visible_initial",
+            &owner.tmux_visible().unwrap_or(false).to_string(),
+        );
+    }
     pager.metrics.push("cols", &geometry.cols().to_string());
     pager.metrics.push("rows", &geometry.rows().to_string());
     let cell = geometry.cell();
@@ -962,6 +978,16 @@ impl Metrics {
 
     fn push(&mut self, key: &str, value: &str) {
         self.lines.push((key.to_string(), value.to_string()));
+    }
+
+    /// Increment a counter line; written as `key=<n>` at exit.
+    fn count(&mut self, key: &str) {
+        if let Some((_, value)) = self.lines.iter_mut().find(|(name, _)| name == key) {
+            let next = value.parse::<u64>().unwrap_or(0) + 1;
+            *value = next.to_string();
+        } else {
+            self.push(key, "1");
+        }
     }
 
     fn write(&self, path: Option<&str>) -> Result<(), String> {

@@ -1,0 +1,21 @@
+mode=live
+placement=tmux
+image_id=6702799
+tmux=tmux 3.5a pane %0 client xterm-ghostty (ghostty 1.4.0) passthrough=on
+tmux_visible_initial=true
+cols=177
+rows=54
+cell_width_px=17
+cell_height_px=34
+css_width=1416.0
+css_height=848.0
+scale=2.125
+document_nodes=378
+term_program=tmux
+term=tmux-256color
+png_bytes_first_frame=483148
+frame_bytes_first_frame=726580
+cold_start_to_frame_write_ms=237.7
+tmux_repaints=2
+frames=33
+peak_rss_bytes=51757056

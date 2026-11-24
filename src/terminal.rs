@@ -18,11 +18,16 @@
 //! `docs/terminal-session.md`.
 //!
 //! Startup order is fixed: the caller validates/loads the document first, then
-//! calls [`TerminalOwner::open`]. Probing happens before the alternate screen is
-//! entered, so a failed probe leaves the normal screen untouched and maps to the
-//! caller's plain-text path. The returned error distinguishes timeout,
-//! unsupported graphics, unexpected replies, missing geometry, and incomplete
-//! replies.
+//! calls [`TerminalOwner::open`]. Probing (or tmux pane validation) happens
+//! before the alternate screen is entered, so a failure leaves the normal
+//! screen untouched and maps to the caller's plain-text path. The returned
+//! error distinguishes timeout, unsupported graphics, unexpected replies,
+//! missing geometry, incomplete replies, and actionable tmux failures.
+//!
+//! Inside tmux the owner does not probe the pane PTY: `crate::tmux` validates
+//! the pane and attached Ghostty client instead, and the owner wraps every
+//! graphics command for passthrough and paints a Unicode placeholder grid as
+//! ordinary pane output.
 
 use std::{
     env, fmt,
@@ -33,6 +38,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+use crate::tmux::{self, TmuxError, TmuxPane};
 
 /// Stable image id (`"GLIS"`). Every frame replaces this one image.
 pub const DEFAULT_IMAGE_ID: u32 = 0x474c_4953;
@@ -133,6 +140,7 @@ pub enum TerminalError {
     Size(String),
     Probe(ProbeError),
     Geometry(GeometryError),
+    Tmux(TmuxError),
     InvalidPng,
     FrameTooLarge {
         png_bytes: usize,
@@ -160,6 +168,7 @@ impl fmt::Display for TerminalError {
             Self::Size(detail) => write!(f, "terminal size: {detail}"),
             Self::Probe(err) => write!(f, "{err}"),
             Self::Geometry(err) => write!(f, "{err}"),
+            Self::Tmux(err) => write!(f, "{err}"),
             Self::InvalidPng => write!(f, "frame is not a PNG"),
             Self::FrameTooLarge {
                 png_bytes,
@@ -180,6 +189,7 @@ impl std::error::Error for TerminalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Tmux(err) => Some(err),
             _ => None,
         }
     }
@@ -522,6 +532,28 @@ pub fn terminal_size(fd: RawFd) -> io::Result<(u16, u16)> {
         }
         Ok((ws.ws_col, ws.ws_row))
     }
+}
+
+/// Input descriptor for the pager. `stdin` is used when it is the stdout TTY;
+/// otherwise the device name behind stdout is opened directly. On macOS
+/// `fstat`/`poll` on the `/dev/tty` pseudo-device do not identify the
+/// underlying pts, so opening the name is what makes piped stdin interactive.
+fn open_input(output_fd: RawFd) -> Result<(RawFd, Option<File>), TerminalError> {
+    let stdin_fd = libc::STDIN_FILENO;
+    if is_tty(stdin_fd) && same_tty(stdin_fd, output_fd) {
+        return Ok((stdin_fd, None));
+    }
+    let name = tty_name(output_fd).ok_or(TerminalError::NotSameTerminal)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&name)
+        .map_err(|err| TerminalError::TtyOpen(err.to_string()))?;
+    let fd = file.as_raw_fd();
+    if !is_tty(fd) {
+        return Err(TerminalError::NotATerminal("controlling terminal"));
+    }
+    Ok((fd, Some(file)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1084,14 @@ pub struct FrameStats {
 // Terminal owner
 // ---------------------------------------------------------------------------
 
+/// How the viewport image is placed in the terminal.
+enum Placement {
+    /// Direct Kitty placement: the pane is the outer terminal.
+    Direct,
+    /// Kitty virtual placement through tmux passthrough plus a placeholder grid.
+    Tmux(TmuxPane),
+}
+
 pub struct TerminalOwner {
     input_fd: RawFd,
     output_fd: RawFd,
@@ -1062,6 +1102,8 @@ pub struct TerminalOwner {
     geometry: Geometry,
     environment: EnvironmentHint,
     probe: ProbeReport,
+    placement: Placement,
+    image_id: u32,
     /// Parsed ordinary keys not yet returned to the caller.
     keys_pending: Vec<u8>,
     /// Incomplete escape sequence retained between reads.
@@ -1070,13 +1112,17 @@ pub struct TerminalOwner {
     alternate_active: bool,
     cursor_hidden: bool,
     finished: bool,
+    /// Last bounded tmux visibility/geometry re-check.
+    tmux_last_sync: Instant,
+    /// A pane became visible again; redraw the latest frame once.
+    tmux_repaint: bool,
 }
 
 impl fmt::Debug for TerminalOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TerminalOwner")
             .field("geometry", &self.geometry)
-            .field("image_id", &self.config.image_id)
+            .field("image_id", &self.image_id)
             .field("finished", &self.finished)
             .finish_non_exhaustive()
     }
@@ -1101,27 +1147,13 @@ impl TerminalOwner {
         if !is_tty(output_fd) {
             return Err(TerminalError::NotATerminal("stdout"));
         }
-        let stdin_fd = libc::STDIN_FILENO;
-        let (input_fd, input_file) = if is_tty(stdin_fd) && same_tty(stdin_fd, output_fd) {
-            (stdin_fd, None)
-        } else {
-            // `/dev/tty` is a pseudo-device on macOS: `fstat` reports the
-            // device itself, and `poll` on it can return POLLNVAL. Open the
-            // device name behind the stdout terminal instead. The shared
-            // cell/graphics probe below then confirms that reads and writes
-            // reach the same terminal.
-            let name = tty_name(output_fd).ok_or(TerminalError::NotSameTerminal)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&name)
-                .map_err(|err| TerminalError::TtyOpen(err.to_string()))?;
-            let fd = file.as_raw_fd();
-            if !is_tty(fd) {
-                return Err(TerminalError::NotATerminal("controlling terminal"));
-            }
-            (fd, Some(file))
-        };
+        let (input_fd, input_file) = open_input(output_fd)?;
+
+        if tmux::is_candidate() {
+            let pane = tmux::detect().map_err(TerminalError::Tmux)?;
+            return Self::establish_tmux(input_fd, output_fd, input_file, pane, config);
+        }
+
         Self::establish(input_fd, output_fd, input_file, None, config)
     }
 
@@ -1201,22 +1233,108 @@ impl TerminalOwner {
             });
         }
 
+        let image_id = config.image_id;
         Ok(Self {
             input_fd,
             output_fd,
             _input_file: input_file,
             _output_file: output_file,
             saved_termios: Some(saved),
+            image_id,
             config,
             geometry,
             environment: EnvironmentHint::detect(),
             probe,
+            placement: Placement::Direct,
             keys_pending: pending_keys,
             input_buffer: Vec::new(),
             image_owned: false,
             alternate_active: true,
             cursor_hidden: true,
             finished: false,
+            tmux_last_sync: Instant::now(),
+            tmux_repaint: false,
+        })
+    }
+
+    /// tmux placement: validate a measured pane/client, then enter the
+    /// pane-local alternate screen. No probe is sent, because `CSI 16t` and
+    /// `ESC _G` do not reach the outer Ghostty through the pane PTY.
+    fn establish_tmux(
+        input_fd: RawFd,
+        output_fd: RawFd,
+        input_file: Option<File>,
+        pane: TmuxPane,
+        config: TerminalConfig,
+    ) -> Result<Self, TerminalError> {
+        config.validate()?;
+        if !is_tty(input_fd) {
+            return Err(TerminalError::NotATerminal("input"));
+        }
+        if !is_tty(output_fd) {
+            return Err(TerminalError::NotATerminal("output"));
+        }
+        if input_file.is_none() && !same_tty(input_fd, output_fd) {
+            return Err(TerminalError::NotSameTerminal);
+        }
+
+        let cell = CellPixels::new(pane.cell_width(), pane.cell_height()).ok_or_else(|| {
+            TerminalError::Tmux(TmuxError {
+                kind: tmux::TmuxFailureKind::Geometry,
+                detail: format!(
+                    "client {} reports cell size {}x{}; expected 1..=4096",
+                    pane.client_tty(),
+                    pane.cell_width(),
+                    pane.cell_height()
+                ),
+            })
+        })?;
+        let (cols, rows) =
+            terminal_size(output_fd).map_err(|err| TerminalError::Size(err.to_string()))?;
+        let geometry = Geometry::compute_with_cap(
+            cols,
+            rows,
+            cell,
+            config.status_rows,
+            config.max_raster_pixels,
+        )?;
+
+        let saved =
+            read_termios(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
+        set_raw(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
+        if let Err(err) =
+            write_fd(output_fd, ENTER_ALT).and_then(|_| write_fd(output_fd, HIDE_CURSOR))
+        {
+            let _ = restore_termios(input_fd, &saved);
+            return Err(TerminalError::Io {
+                op: "enter alternate screen",
+                source: err,
+            });
+        }
+
+        Ok(Self {
+            input_fd,
+            output_fd,
+            _input_file: input_file,
+            _output_file: None,
+            saved_termios: Some(saved),
+            config,
+            geometry,
+            environment: EnvironmentHint::detect(),
+            probe: ProbeReport {
+                cell,
+                elapsed: Duration::ZERO,
+            },
+            placement: Placement::Tmux(pane),
+            image_id: tmux::session_image_id(),
+            keys_pending: Vec::new(),
+            input_buffer: Vec::new(),
+            image_owned: false,
+            alternate_active: true,
+            cursor_hidden: true,
+            finished: false,
+            tmux_last_sync: Instant::now(),
+            tmux_repaint: false,
         })
     }
 
@@ -1225,7 +1343,38 @@ impl TerminalOwner {
     }
 
     pub fn image_id(&self) -> u32 {
-        self.config.image_id
+        self.image_id
+    }
+
+    /// `"direct"` for a Ghostty/Kitty terminal, `"tmux"` for the passthrough
+    /// placeholder path. Metrics and diagnostics only.
+    pub fn placement_name(&self) -> &'static str {
+        match self.placement {
+            Placement::Direct => "direct",
+            Placement::Tmux(_) => "tmux",
+        }
+    }
+
+    /// One-line tmux/client description for metrics and the status line.
+    pub fn tmux_summary(&self) -> Option<String> {
+        match &self.placement {
+            Placement::Direct => None,
+            Placement::Tmux(pane) => Some(pane.summary()),
+        }
+    }
+
+    pub fn tmux_visible(&self) -> Option<bool> {
+        match &self.placement {
+            Placement::Direct => None,
+            Placement::Tmux(pane) => Some(pane.visible()),
+        }
+    }
+
+    /// True once after the pane becomes visible again. The caller redraws the
+    /// latest frame so a reattached/refocused pane shows current pixels even
+    /// when graphics output was dropped while it was hidden.
+    pub fn take_repaint_request(&mut self) -> bool {
+        std::mem::take(&mut self.tmux_repaint)
     }
 
     pub fn environment(&self) -> &EnvironmentHint {
@@ -1239,8 +1388,46 @@ impl TerminalOwner {
     /// Read the current grid size via `TIOCGWINSZ` and recompute geometry when
     /// it changed. Cell pixel size is retained; call [`Self::resize_with_cell`]
     /// after a font-size change, or [`Self::reprobe_cell`] to measure it again.
+    ///
+    /// In tmux mode this also performs a bounded (at most once per
+    /// [`tmux::SYNC_INTERVAL`]) re-check of pane visibility and the attached
+    /// client's cell pixels. A client font zoom or pane resize therefore
+    /// reflows, and a pane returning to view requests one repaint.
     pub fn refresh_size(&mut self) -> Result<Option<Geometry>, TerminalError> {
         self.ensure_live()?;
+
+        if let Placement::Tmux(pane) = &mut self.placement {
+            let mut changed = false;
+            if self.tmux_last_sync.elapsed() >= tmux::SYNC_INTERVAL {
+                self.tmux_last_sync = Instant::now();
+                let refresh = pane.sync().map_err(TerminalError::Tmux)?;
+                changed |= refresh.geometry_changed;
+                if refresh.became_visible {
+                    self.tmux_repaint = true;
+                }
+            }
+            let (cols, rows) = terminal_size(self.output_fd)
+                .map_err(|err| TerminalError::Size(err.to_string()))?;
+            if cols != self.geometry.cols() || rows != self.geometry.rows() {
+                changed = true;
+            }
+            if !changed {
+                return Ok(None);
+            }
+            let cell = CellPixels::new(pane.cell_width(), pane.cell_height()).ok_or_else(|| {
+                TerminalError::Tmux(TmuxError {
+                    kind: tmux::TmuxFailureKind::Geometry,
+                    detail: format!(
+                        "client {} reports cell size {}x{}; expected 1..=4096",
+                        pane.client_tty(),
+                        pane.cell_width(),
+                        pane.cell_height()
+                    ),
+                })
+            })?;
+            return Ok(Some(self.resize_with_cell(cols, rows, cell)?));
+        }
+
         let (cols, rows) =
             terminal_size(self.output_fd).map_err(|err| TerminalError::Size(err.to_string()))?;
         if cols == self.geometry.cols() && rows == self.geometry.rows() {
@@ -1275,6 +1462,10 @@ impl TerminalOwner {
     /// after a font-size change, not on every resize event.
     pub fn reprobe_cell(&mut self) -> Result<CellPixels, TerminalError> {
         self.ensure_live()?;
+        if matches!(self.placement, Placement::Tmux(_)) {
+            // Cell pixels come from tmux client metadata, not a pane query.
+            return Ok(self.geometry.cell());
+        }
         let started = Instant::now();
         let deadline = started + self.config.probe_budget;
         if let Err(err) = write_fd(self.output_fd, b"\x1b[16t") {
@@ -1429,28 +1620,62 @@ impl TerminalOwner {
 
         let geometry = self.geometry;
         let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(self.config.chunk_bytes).collect();
-        let mut wire = Vec::with_capacity(encoded.len() + chunks.len() * 24 + 16);
-        wire.extend_from_slice(SAVE_CURSOR);
-        wire.extend_from_slice(b"\x1b[H");
-        for (index, chunk) in chunks.iter().enumerate() {
-            let more = usize::from(index + 1 < chunks.len());
-            if index == 0 {
-                wire.extend_from_slice(
-                    format!(
-                        "\x1b_Ga=T,f=100,i={},q=2,C=1,c={},r={},m={more};",
-                        self.config.image_id,
-                        geometry.cols(),
-                        geometry.content_rows()
-                    )
-                    .as_bytes(),
-                );
-            } else {
-                wire.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+        let mut wire = Vec::with_capacity(encoded.len() + chunks.len() * 32 + 16);
+        let mut grid = Vec::new();
+        match &self.placement {
+            Placement::Direct => {
+                wire.extend_from_slice(SAVE_CURSOR);
+                wire.extend_from_slice(b"\x1b[H");
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let more = usize::from(index + 1 < chunks.len());
+                    if index == 0 {
+                        wire.extend_from_slice(
+                            format!(
+                                "\x1b_Ga=T,f=100,i={},q=2,C=1,c={},r={},m={more};",
+                                self.image_id,
+                                geometry.cols(),
+                                geometry.content_rows()
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        wire.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                    }
+                    wire.extend_from_slice(chunk);
+                    wire.extend_from_slice(b"\x1b\\");
+                }
+                wire.extend_from_slice(RESTORE_CURSOR);
             }
-            wire.extend_from_slice(chunk);
-            wire.extend_from_slice(b"\x1b\\");
+            Placement::Tmux(_) => {
+                // Each Kitty command is a separate DCS passthrough. Retransmit
+                // the image and its virtual placement every frame: Ghostty 1.4
+                // replaces an existing image id and its old placements, which
+                // is exactly what the placeholder grid expects.
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let more = usize::from(index + 1 < chunks.len());
+                    let mut inner = Vec::with_capacity(chunk.len() + 80);
+                    if index == 0 {
+                        inner.extend_from_slice(
+                            format!(
+                                "\x1b_Ga=T,f=100,i={},p=1,q=2,U=1,c={},r={},m={more};",
+                                self.image_id,
+                                geometry.cols(),
+                                geometry.content_rows()
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        inner.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+                    }
+                    inner.extend_from_slice(chunk);
+                    inner.extend_from_slice(b"\x1b\\");
+                    wire.extend_from_slice(&tmux::wrap_dcs(&inner));
+                }
+                grid =
+                    tmux::placeholder_grid(self.image_id, geometry.cols(), geometry.content_rows())
+                        .map_err(TerminalError::Tmux)?;
+            }
         }
-        wire.extend_from_slice(RESTORE_CURSOR);
 
         // Mark the image as owned before the write: a partial transmission can
         // still register the image, and cleanup must delete it.
@@ -1459,11 +1684,17 @@ impl TerminalOwner {
             op: "viewport frame write",
             source: err,
         })?;
+        if !grid.is_empty() {
+            write_fd(self.output_fd, &grid).map_err(|err| TerminalError::Io {
+                op: "placeholder grid write",
+                source: err,
+            })?;
+        }
         Ok(FrameStats {
             png_bytes: png.len(),
             encoded_bytes: encoded.len(),
             chunks: chunks.len(),
-            wire_bytes: wire.len(),
+            wire_bytes: wire.len() + grid.len(),
         })
     }
 
@@ -1490,9 +1721,14 @@ impl TerminalOwner {
 
         let mut sequence = Vec::new();
         if self.image_owned {
-            sequence.extend_from_slice(
-                format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.config.image_id).as_bytes(),
-            );
+            match &self.placement {
+                Placement::Direct => sequence.extend_from_slice(
+                    format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id).as_bytes(),
+                ),
+                Placement::Tmux(_) => {
+                    sequence.extend_from_slice(&tmux::delete_command(self.image_id))
+                }
+            }
             self.image_owned = false;
         }
         if self.cursor_hidden {

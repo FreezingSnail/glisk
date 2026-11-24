@@ -13,6 +13,9 @@ The module is wired into `src/main.rs` by bead `glisk-2hp.8`; the CLI
 opens it only after bounded ingestion and mode selection. The integration test
 also includes the module with `#[path = "../src/terminal.rs"]`.
 
+`src/tmux.rs` is the pane-scoped tmux path used by the same owner. It is never
+selected for `--text` or redirected stdout, and it never changes tmux settings.
+
 ## Integration contract
 
 Call order for the pager:
@@ -48,17 +51,18 @@ same-terminal check. This is what makes
 
 | Item | Contract |
 |---|---|
-| `TerminalOwner::open()` / `open_with_config` | `stdout` must be a TTY. Input is `stdin` when it is the same TTY, otherwise the device name behind `stdout` is opened. The shared cell/graphics probe confirms reads and writes reach the same terminal. Failure is an error, never a silent fallback. |
-| `TerminalOwner::from_fds(input, output, config)` | Same checks for already-open descriptors; neither descriptor is closed by the owner. Used by PTY tests. |
+| `TerminalOwner::open()` / `open_with_config` | `stdout` must be a TTY. Inside tmux it first validates the pane/client (no probe); otherwise the shared cell/graphics probe confirms reads and writes reach the same terminal. Failure is an error, never a silent fallback. |
+| `TerminalOwner::from_fds(input, output, config)` | Same checks for already-open descriptors; neither descriptor is closed by the owner. Used by direct PTY tests; never selects tmux. |
 | `geometry()` | Validated grid, content rows above the status row, cell pixels, physical raster, CSS viewport, and derived scale. |
 | `resize` / `resize_with_cell` | Recompute and validate; a failed resize leaves the previous geometry intact. |
-| `refresh_size()` | `TIOCGWINSZ`; returns `None` when cols/rows are unchanged. |
-| `reprobe_cell()` | Repeat only the bounded `CSI 16t` query, retaining keys typed meanwhile. |
+| `refresh_size()` | `TIOCGWINSZ`; in tmux also the bounded visibility/client re-check. Returns `None` when nothing changed. |
+| `take_repaint_request()` | True once after a tmux pane becomes visible again; the pager redraws its latest frame. |
+| `reprobe_cell()` | Repeat only the bounded `CSI 16t` query, retaining keys typed meanwhile. In tmux the measured client cell is retained instead. |
 | `poll_input(timeout)` | Returns ordinary key bytes unchanged, consumes late/foreign protocol replies, and reports `0x03` as `interrupt`. A lone Escape is returned as a key after an idle poll. |
-| `present(png)` | One full Kitty transmission for the stable image id, or a bounded error before any write. |
+| `present(png)` | One full direct Kitty transmission, or in tmux the wrapped image/virtual placement plus the placeholder grid; a bounded error is returned before any write. |
 | `paint_status(text)` | Clears and writes the last row with the cursor preserved; strips escape sequences, C0/C1/DEL, and truncates to the grid width. |
-| `finish()` | Idempotent delete-image + show-cursor + leave-alternate-screen + restore-termios sequence. |
-| `image_id()`, `environment()`, `probe_report()` | Diagnostics and metrics. Environment values are hints only. |
+| `finish()` | Idempotent delete-image (raw or passthrough) + show-cursor + leave-alternate-screen + restore-termios sequence. |
+| `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `probe_report()` | Diagnostics and metrics. Environment values are hints only. |
 
 ## Mode outcomes
 
@@ -81,6 +85,77 @@ There is deliberately **no guessed-cell fallback**. The previous spike's
 `--cell-width-px` / `--cell-height-px` fallback is not part of this owner; a
 missing measurement is a text-mode decision.
 
+## tmux placement
+
+Selection is decided before raw mode and before the alternate screen is
+entered. `TMUX` and `TMUX_PANE` make the owner try `tmux::detect()` first; no
+`CSI 16t` or `ESC _G` probe is sent through the pane PTY. Detection is read-only
+and uses fixed arguments, a 250 ms budget per query, a response bound, and
+validated fields:
+
+1. `TMUX` socket path, numeric `TMUX_PANE`, stdout TTY name.
+2. `display-message` for tmux version, pane id/TTY/size/active/window/zoom/dead,
+   session id, and attached count.
+3. `show-options -A -p -v ... allow-passthrough` and `alternate-screen` for the
+   effective pane values.
+4. `list-clients -t <session>` for exactly one client: termname, termtype, cell
+   pixels, control-mode, UTF-8, pid.
+5. `show-options -s terminal-overrides/terminal-features` to check whether a
+   matching entry disables the 24-bit color needed by the placeholder image id.
+
+The pane PTY (`TIOCGWINSZ`) owns rows/columns; the client owns cell pixels. The
+accepted matrix is tmux 3.5+ (tested 3.5a), `TERM=xterm-ghostty`, Ghostty 1.4+
+(validated when tmux resolves the termtype), one attached display client, UTF-8,
+truecolor, and a supported grid. Every other case returns an actionable
+`TerminalError::Tmux` before the alternate screen, and the CLI writes plain
+text.
+
+The disposable-pane check also records what a pane sees: tmux 3.5a answers
+`CSI 16t` inside the pane from the attached client's cell size, while the basic
+Kitty query produces no pane reply. The owner still uses the tmux metadata above
+for both values, matching the design choice not to depend on an outer probe.
+
+### Framing
+
+Each Kitty graphics command is wrapped as
+`ESC Ptmux; <inner with every ESC doubled> ESC \`. That includes every bounded
+PNG chunk (first chunk `a=T,f=100,i=<id>,p=1,q=2,U=1,c=<cols>,r=<content_rows>`,
+later chunks `m=0|1;<base64>`), the session-image deletion
+(`a=d,d=I,i=<id>,q=2`), and nothing else. Uploads/deletes are quiet (`q=2`).
+Ghostty 1.4 replaces an existing image id and its placements, so every frame
+re-sends the image and its virtual placement before repainting the grid.
+
+The visible image is **ordinary pane text**: `ESC[2J ESC[H`, one truecolor
+foreground (`38:2:<r>:<g>:<b>`, image id in 24 bits), then
+`U+10EEEE` + row diacritic + column diacritic per cell, row by row. tmux clips
+and repaints these cells itself. Cursor motion, styles, the alternate screen,
+and the status row stay pane-local. Image ids mix the process id and clock,
+never 0 or the probe id, and cleanup deletes only that id.
+
+### Bounds
+
+| Bound | Value |
+|---|---|
+| tmux query response | 8 KiB per query, 250 ms |
+| sync interval | 500 ms minimum |
+| placeholder rows/cols | 297 (diacritic table) |
+| placeholder grid output | 1 MiB |
+| raster / PNG / base64 | existing 8,388,608 px / 4 MiB / 4 MiB owner limits |
+
+### Visibility and cleanup
+
+`refresh_size()` also performs a bounded re-check. A pane is considered visible
+when the session has a client, its window is active, the pane is not dead, and
+it is either unzoomed or the active pane. A hidden→visible transition requests
+one repaint of the latest frame, because `allow-passthrough=on` drops graphics
+for hidden panes. Client cell changes and pane resizes recompute geometry.
+
+`q`, Ctrl+C, and handled errors run the same `finish()`: delete the owned image
+through passthrough, show the cursor, leave the pane-local alternate screen, and
+restore termios. With `allow-passthrough=on` a deletion issued while the pane is
+hidden is dropped by tmux; Glisk only claims deletion when the target permits
+it.
+
 ## Geometry
 
 ```
@@ -97,6 +172,8 @@ pixels within the 8,388,608 provisional budget. The wire frame is also bounded
 to 4 MiB PNG and 4 MiB base64.
 
 ## Kitty transmission
+
+Direct path (the pane is the outer terminal):
 
 - One image id (`0x474c4953`, `"GLIS"`) for the whole session. Every frame is
   `a=T,f=100,i=<id>,q=2,C=1,c=<cols>,r=<content_rows>` and replaces the previous
@@ -118,16 +195,19 @@ to 4 MiB PNG and 4 MiB base64.
 | Ctrl+C | Raw mode delivers `0x03`; `poll_input` sets `interrupt`; caller calls `finish()`. |
 | Handled renderer/output error | Caller calls `finish()` before diagnostics; the `Drop` backstop covers early returns. |
 | Probe/geometry failure | Owner was never constructed past the probe; saved termios is restored before returning the error. No alternate screen was entered. |
+| tmux detection failure | Owner was never constructed; no raw mode, alternate screen, or tmux setting was changed. Plain text follows on the normal pane screen. |
 | Panic/unwind | `Drop` runs the same cleanup. |
 
-Cleanup deletes the image only if one was transmitted, then shows the cursor,
-leaves the alternate screen, and restores the saved termios. Diagnostics must be
-printed after cleanup so they remain on the normal screen.
+Cleanup deletes the image only if one was transmitted (raw ESC for the direct
+path, DCS-wrapped for tmux), then shows the cursor, leaves the alternate screen,
+and restores the saved termios. Diagnostics must be printed after cleanup so
+they remain on the normal screen.
 
 ## Tests
 
 ```
 cargo test --test terminal_session
+cargo test --test tmux_passthrough
 ```
 
 Deterministic pseudo-terminal coverage:
@@ -145,28 +225,40 @@ Deterministic pseudo-terminal coverage:
 
 Unit tests in `terminal.rs` cover scanner framing and status/geometry helpers.
 
-## Remaining live Ghostty checks (not claimed by these tests)
+`tmux_passthrough` owns an isolated server and the outer PTY for every test:
 
-These are honest gaps; the PTY tests prove protocol bytes and mode restoration,
-not the compositor. They must be repeated in a real Ghostty 1.4 window:
+- wrapped/quiet Kitty transmission, DCS stripping with passthrough on, and no
+  graphics with it off;
+- exact placeholder cell delivery, truecolor foreground, resize redraw;
+- two panes with distinct ids and deletion scoped to one id;
+- the full binary through the tmux path, `q` and Ctrl+C pane restoration;
+- fallbacks for an unsupported client, zero cell geometry, and two attached
+  clients.
 
-1. Probe replies and the 250 ms shared budget under a real Kitty protocol
-   terminal, including a cold start, a slow first paint, and a terminal that
-   ignores `CSI 16t`.
-2. Visible placement above the status row, exact cell fit, and replacement of
-   the previous image with no accumulation during rapid scrolling.
-3. Cursor position and shell prompt after normal `q`, real Ctrl+C, and an
-   injected renderer/output failure (the earlier spike launched with
-   `Ghostty -e`, so no shell prompt was observed).
-4. Live resize/reflow, including the semantic scroll anchor, preserved focus and
-   disclosures, and a window too small to draw (geometry error path).
-5. Cell calibration on a standard-density display and at other font sizes; the
-   spike measured Retina `17x34` at font 14 only.
-6. Real keyboard input through the probe window (the PTY tests inject bytes, not
-   OS keys), and the interaction between a key typed during the probe and the
-   pager's first action.
-7. Multiplexers and terminals that do not implement Kitty graphics; these must
-   select text mode via the probe, not environment hints.
-8. External `SIGINT`/`SIGTERM` while the synchronous loop is busy. Raw mode
+## Live coverage and remaining gaps
+
+`docs/evidence/tmux-ghostty.md` records the Ghostty 1.4.0 + tmux 3.5a live run:
+a real attached client (17×34 cells), complete placeholder grids, pane resize
+and zoom, two simultaneous pagers, window away/back repaint, `q`/Ctrl+C shell
+restoration, stdin, `--text`, redirected output, passthrough-off fallback, and
+the direct Ghostty owner path.
+
+These remain human/compositor checks:
+
+1. A visible screenshot of the rendered table/chart inside the split pane.
+   `screencapture` was denied in the test environment, so the image's *pixels*
+   are established by protocol and client, not by a captured screenshot.
+2. Exact cell fit and absence of any visible overlay/bleed in neighboring panes
+   during rapid scrolling; the protocol test proves tmux clips placeholder cells
+   and deletes only the owned image.
+3. Real OS keyboard input for the direct (non-tmux) Ghostty path. The tmux live
+   run used tmux `send-keys`; the direct live run used `--once`, so no physical
+   key was observed.
+4. A real font-size change (Ghostty zoom) as opposed to a tmux pane resize. The
+   client-cell re-check is implemented and covered by the bounded sync path, but
+   the live run only changed pane/window geometry.
+5. External `SIGINT`/`SIGTERM` while the synchronous loop is busy. Raw mode
    turns keyboard Ctrl+C into `0x03`, but this owner does not install an async
    signal handler; a process signal during a long frame is still a gap.
+6. Detach/reattach, multiple attached clients, nested tmux, and remote
+   transports are intentionally outside the initial matrix.

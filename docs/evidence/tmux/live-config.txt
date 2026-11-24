@@ -1,0 +1,11 @@
+tmux 3.5a
+Ghostty 1.4.0
+ghostty client: /dev/ttys015 xterm-ghostty "ghostty 1.4.0" 17x34 attached,focused,UTF-8
+isolated session: tmux -S <unique> -f /dev/null; pane allow-passthrough=on; terminal-overrides xterm*:Tc
+live pane 0: 177x54 -> 9381 placeholder cells (177x53); image id 6702799
+live pane 1 (split): 59x40 -> 2301 placeholder cells (59x39); image id 3922669
+zoom pane 1: 120x40 -> 4680 placeholder cells (120x39)
+resize pane 0: 120x40 -> 4680 placeholder cells; state preserved
+window away/back: pane 0 grid 2340 cells; tmux_repaints=2
+direct Ghostty: placement=direct; image id 1196181843; 17x34 cells; 177x55
+screencapture: denied ("could not create image from display")

@@ -6,6 +6,9 @@
 //! tiny terminal emulator: it answers the bounded probes, captures the
 //! escape-sequence stream, and checks mode restoration.
 
+#[path = "../src/tmux.rs"]
+mod tmux;
+
 #[path = "../src/terminal.rs"]
 mod terminal;
 
