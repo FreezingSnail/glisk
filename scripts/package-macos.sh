@@ -20,11 +20,15 @@ name="glisk-v0-macos-$arch"
 out="dist/$name"
 
 cargo build --release --locked
-mkdir -p "$out/docs" "$out/examples"
+mkdir -p "$out/docs" "$out/examples/tour"
 install -m 0755 target/release/glisk "$out/glisk"
 install -m 0755 target/release/glisk dist/glisk
+install -m 0644 examples/README.md "$out/examples/README.md"
 install -m 0644 examples/decision-report.html "$out/examples/decision-report.html"
 install -m 0644 examples/animated-cache.html "$out/examples/animated-cache.html"
+install -m 0644 examples/tour/index.html "$out/examples/tour/index.html"
+install -m 0644 examples/tour/motion.html "$out/examples/tour/motion.html"
+install -m 0644 examples/tour/reload.html "$out/examples/tour/reload.html"
 install -m 0644 docs/authoring.md "$out/docs/authoring.md"
 install -m 0644 docs/cli.md "$out/docs/cli.md"
 
@@ -32,9 +36,11 @@ cat >"$out/README.txt" <<'EOF'
 Glisk v0 - live local HTML report pager for macOS/Ghostty 1.4+
 
 Run:
+  ./glisk examples/tour
+  ./glisk examples/tour/index.html
+  ./glisk examples/tour/index.html --text
+  cat examples/tour/index.html | ./glisk -
   ./glisk examples/decision-report.html
-  ./glisk examples/decision-report.html --text
-  cat examples/decision-report.html | ./glisk -
 
 Read docs/authoring.md before generating a new report. Glisk is a local
 document reader: one .htm/.html file or stdin, inline CSS/SVG/PNG only, no

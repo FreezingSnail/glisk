@@ -42,8 +42,12 @@ The measurements, artifact sizes, and checksums below are the historical
 | `dist/glisk` | 13,057,872 B (12.45 MiB) | `ee2c6bacacf7a7e97b0769ad51d593f1fd86d3578986b80331c73be4032d6bf0` |
 | `dist/glisk-v0-macos-aarch64.tar.gz` | 5,713,550 B | `12ce8ff3387800845643115bca875e0b9c215da58c020a634ea4e9f8361f632c` |
 
-The bundle contains `glisk`, `examples/decision-report.html`,
-`docs/authoring.md`, `docs/cli.md`, `README.txt`, and `SHA256SUMS`.
+The historical `glisk-2hp.9` bundle contains `glisk`,
+`examples/decision-report.html`, `docs/authoring.md`, `docs/cli.md`,
+`README.txt`, and `SHA256SUMS`. The current packaging script also ships
+`examples/README.md`, `examples/animated-cache.html`, and the three
+`examples/tour/` reports; the artifact size and checksums above predate that
+addition.
 
 Reproducibility: two consecutive `scripts/package-macos.sh` runs produced the
 same binary and tarball SHA-256 (`package-before.txt`, `package-after.txt`). The

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Animation pause and resume</title>
+<style>
+  :root { color-scheme: dark; background: #101821; color: #edf4f8; --line: #344757; --card: #1a2632; --accent: #71dfbd; --warn: #f4bf73; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 "Helvetica Neue", Helvetica, Arial, sans-serif; background: #101821; color: #edf4f8; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 18px 36px; }
+  h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.15; }
+  h2 { margin: 0 0 8px; font-size: 19px; }
+  p { margin: 0 0 14px; color: #c1ccd6; }
+  .lede { font-size: 16px; }
+  .figure { margin: 0 0 18px; padding: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
+  .track { position: relative; height: 128px; }
+  .track svg { display: block; width: 100%; height: 128px; }
+  .marker { position: absolute; top: 26px; left: 0; width: 100%; height: 14px; transform: translateX(-46%); }
+  .marker span { display: block; width: 14px; height: 14px; margin: 0 auto; border-radius: 50%; background: #f4fbff; }
+  .fast { animation: fast 6s linear infinite; }
+  .safe { top: 84px; animation: safe 6s linear infinite; }
+  @keyframes fast {
+    0% { transform: translateX(-46%); }
+    18%, 100% { transform: translateX(46%); }
+  }
+  @keyframes safe {
+    0% { transform: translateX(-46%); }
+    18%, 30% { transform: translateX(0%); }
+    64%, 100% { transform: translateX(46%); }
+  }
+  .labels { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 4px; font-size: 14px; color: #c1ccd6; }
+  .fast-label { color: var(--accent); }
+  .safe-label { color: var(--warn); }
+  figcaption { margin: 10px 4px 0; color: #c1ccd6; font-size: 14px; }
+  .keys { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 18px; }
+  .keys div { flex: 1 1 220px; min-width: 0; padding: 10px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; font-size: 14px; color: #c1ccd6; }
+  .keys strong { color: var(--accent); }
+  code { background: #223040; border-radius: 4px; padding: 1px 4px; color: #edf4f8; }
+  a { color: var(--accent); }
+  a:focus, summary:focus { outline: 3px solid var(--accent); outline-offset: 2px; }
+  details { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 0 14px 2px; }
+  summary { cursor: pointer; padding: 10px 0; color: var(--accent); font-weight: 700; }
+  @media (prefers-reduced-motion: reduce) { .marker { animation: none; } }
+  @media (max-width: 640px) { body { font-size: 15px; } main { padding: 16px 12px 30px; } h1 { font-size: 25px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Animation pause and resume</h1>
+  <p class="lede">The pager advances CSS keyframes while the live view is open. Press <code>p</code> to pause or resume from the current point; <code>--pause-animation</code> opens on the initial frame.</p>
+
+  <figure class="figure" id="motion-figure">
+    <div class="track">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 128" role="img" aria-labelledby="motion-title motion-desc">
+        <title id="motion-title">Two release paths</title>
+        <desc id="motion-desc">The upper marker moves directly to the release. The lower marker pauses at the verification gate before continuing.</desc>
+        <path d="M32 33H368" stroke="#71dfbd" stroke-width="3"/>
+        <path d="M32 91H368" stroke="#f4bf73" stroke-width="3" stroke-dasharray="6 4"/>
+        <path d="M32 25v16m336-16v16" stroke="#71dfbd" stroke-width="2"/>
+        <path d="M32 83v16m160-16v16m176-16v16" stroke="#f4bf73" stroke-width="2"/>
+        <rect x="192" y="81" width="12" height="20" rx="3" fill="#f4bf73"/>
+        <g fill="#a9b8c8" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="11">
+          <text x="32" y="16">direct path</text>
+          <text x="192" y="120">verification gate</text>
+        </g>
+      </svg>
+      <div class="marker fast" aria-hidden="true"><span></span></div>
+      <div class="marker safe" aria-hidden="true"><span></span></div>
+    </div>
+    <figcaption id="motion-caption">
+      <span class="fast-label">Top: direct release.</span> Request to response without a stop.
+      <br><span class="safe-label">Bottom: checked release.</span> Request, verify, then response. The pause is deliberate.
+    </figcaption>
+  </figure>
+
+  <div class="keys">
+    <div id="motion-pause"><strong>p</strong> pauses or resumes both markers from the current point.</div>
+    <div id="motion-initial"><strong>--pause-animation</strong> starts on the initial frame, useful for a still or a review.</div>
+    <div id="motion-text"><strong>--text</strong> and snapshots use the initial state; the caption carries the meaning.</div>
+  </div>
+
+  <details id="motion-notes">
+    <summary>What stays static when the animation is paused?</summary>
+    <p>The diagram, title, description, and caption stay readable. Pause only stops the CSS animation clock. The same document still supports search, fragment links, disclosures, and reload.</p>
+  </details>
+</main>
+</body>
+</html>

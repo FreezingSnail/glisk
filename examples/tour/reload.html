@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live reload with stable ids</title>
+<style>
+  :root { color-scheme: dark; background: #0f1419; color: #e8eef5; --panel: #1b2430; --line: #3b4d60; --muted: #a9b8c8; --accent: #71d6a8; --accent-2: #f0c674; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 22px 18px 36px; background: #0f1419; color: #e8eef5; font: 16px/1.5 "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.15; }
+  h2 { margin: 0 0 8px; font-size: 19px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  .lede { font-size: 16px; }
+  .panel { margin: 0 0 16px; padding: 12px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .panel p:last-child { margin-bottom: 0; }
+  .revision { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 16px; }
+  .revision div { flex: 1 1 190px; min-width: 0; padding: 10px 12px; background: #223040; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; color: var(--muted); }
+  .revision strong { display: block; color: var(--accent-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  code { background: #223040; border-radius: 4px; padding: 1px 4px; color: #e8eef5; }
+  a { color: var(--accent); }
+  a:focus, summary:focus { outline: 3px solid var(--accent); outline-offset: 2px; }
+  details { margin: 0 0 12px; padding: 0 14px 2px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  summary { cursor: pointer; padding: 10px 0; color: var(--accent); font-weight: 700; }
+  .checklist { margin: 0; padding-left: 20px; color: var(--muted); }
+  .checklist li { margin: 0 0 6px; }
+  @media (max-width: 640px) { body { padding: 16px 12px 30px; } h1 { font-size: 25px; } .revision div { flex-basis: 100%; } }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="top">Live reload with stable ids</h1>
+  <p class="lede">Open a copy of this file, keep Glisk in one pane, and save from another. Glisk follows the named file by default; <code>--no-watch</code> holds the revision it opened.</p>
+
+  <div class="panel" id="why-ids">
+    <h2>Why the ids matter</h2>
+    <p>On reload Glisk restores the visible block or its containing section by <code>id</code>, then a surviving preceding heading, then the previous scroll offset. Open disclosure ids, focused controls, and the search query are mapped onto the new document.</p>
+  </div>
+
+  <div class="revision">
+    <div id="reload-version"><strong>Revision</strong>Replace this line when you edit the copy. The id should stay the same.</div>
+    <div id="reload-anchor"><strong>Anchor</strong>Keep <code>id="reload-anchor"</code> on the block you are reading.</div>
+    <div id="reload-details-card"><strong>Disclosure</strong>Keep <code>id="reload-details"</code> open across the save.</div>
+  </div>
+
+  <details id="reload-details" open>
+    <summary>Reload checklist</summary>
+    <ul class="checklist">
+      <li>Copy this example to a working file: <code>cp examples/tour/reload.html reload-demo.html</code>.</li>
+      <li>Open it: <code>glisk reload-demo.html</code>.</li>
+      <li>Edit a paragraph and save. The status row briefly shows the reload result and the reading position stays anchored.</li>
+      <li>Try an invalid save. The last good report stays on screen with a concise reload message.</li>
+      <li>Open a second session with <code>--no-watch</code> and confirm a save does not repaint it.</li>
+    </ul>
+  </details>
+
+  <div class="panel" id="reload-tmux">
+    <h2>Same behavior in tmux</h2>
+    <p>In one supported tmux pane, opt in with <code>tmux set-option -p allow-passthrough on</code> and run Glisk there. Save or atomically regenerate the same path from another pane. Glisk rechecks the pane and re-uploads its latest frame after the pane returns to view.</p>
+  </div>
+
+  <p id="reload-end">End state: <a href="#top">back to the top</a>.</p>
+</main>
+</body>
+</html>

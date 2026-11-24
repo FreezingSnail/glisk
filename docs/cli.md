@@ -195,9 +195,9 @@ macOS bundle from the pinned lockfile:
 
 That runs `cargo build --release --locked` at the repository root,
 writes `dist/glisk`, and creates a deterministic
-`dist/glisk-v0-macos-<arch>.tar.gz` with the example, authoring guide, CLI doc,
-and checksums. Artifacts are ignored by git; the procedure and sources are
-checked in.
+`dist/glisk-v0-macos-<arch>.tar.gz` with the tour, reference examples, example
+index, authoring guide, CLI doc, and checksums. Artifacts are ignored by git;
+the procedure and sources are checked in.
 
 ## Tests
 

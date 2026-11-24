@@ -1,8 +1,9 @@
 # Authoring a Glisk report
 
 Glisk v0 reads one local `.htm`/`.html` file (or stdin) and presents it as a
-live terminal pager. Start from `examples/decision-report.html`; it is the
-reference for every pattern below and is verified in Ghostty 1.4 on macOS.
+live terminal pager. Start from `examples/tour/index.html` for a short tour of
+the supported patterns, or `examples/decision-report.html` for the long
+reference report; both are verified in Ghostty 1.4 on macOS.
 
 ```sh
 glisk report.html          # live pager when the terminal passes the probe
