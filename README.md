@@ -53,13 +53,22 @@ navigation state.*
 one report. Use Tab and Enter for the same fragment and disclosure actions from
 the keyboard.*
 
+![Animated GIF of two left-clicks in Glisk: a fragment link jumps to the disclosure section, then a disclosure summary opens its body](docs/assets/glisk-click.gif)
+
+*A left-click on a same-document fragment link jumps the reading position (the
+status row reports `jumped`); a second left-click on the disclosure summary
+opens its body (the status row reports `evidence expanded`). The two SGR
+left-press reports come from a deterministic PTY capture, and every frame and
+status string is the running pager's own output. Tab and Enter perform the same
+two actions from the keyboard.*
+
 ![Still of the local report picker rooted at examples/tour with three reports](docs/assets/glisk-picker.png)
 
 *The picker is text-only and rooted at `examples/tour`; filtering narrows the
 three reports before Enter opens one in the rich pager.*
 
 The host denied compositor screen capture, so these stills and GIFs are
-assembled from the live pager's own frame PNGs and Ghostty's screen-buffer text.
+assembled from the live pager's own frame PNGs and the status text it wrote.
 [`docs/assets/README.md`](docs/assets/README.md) records the environment,
 method, and regeneration steps.
 

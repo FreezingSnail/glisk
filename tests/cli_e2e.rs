@@ -391,7 +391,7 @@ struct Capture {
 }
 
 impl Capture {
-    fn start(master: RawFd, reply: ProbeReply) -> Self {
+    fn start(master: RawFd, reply: ProbeReply, cell_w: u16, cell_h: u16) -> Self {
         let data = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_data = Arc::clone(&data);
@@ -411,13 +411,15 @@ impl Capture {
                 let saw_cell = seen.windows(5).any(|window| window == b"\x1b[16t");
                 let saw_graphics = seen.windows(5).any(|window| window == b"\x1b_Gi=");
                 if saw_cell && saw_graphics {
-                    let response: &[u8] = match reply {
-                        ProbeReply::GraphicsOk => b"\x1b_Gi=31;OK\x1b\\\x1b[6;32;16t",
-                        ProbeReply::GraphicsError => b"\x1b_Gi=31;EINVAL\x1b\\",
-                        ProbeReply::Timeout => b"",
+                    let response = match reply {
+                        ProbeReply::GraphicsOk => {
+                            format!("\x1b_Gi=31;OK\x1b\\\x1b[6;{cell_h};{cell_w}t").into_bytes()
+                        }
+                        ProbeReply::GraphicsError => b"\x1b_Gi=31;EINVAL\x1b\\".to_vec(),
+                        ProbeReply::Timeout => Vec::new(),
                     };
                     if !response.is_empty() {
-                        write_master(master, response);
+                        write_master(master, &response);
                     }
                     answered = true;
                 }
@@ -505,6 +507,10 @@ struct PtyRun {
     finished: bool,
 }
 
+/// PTY grid and reported cell pixels for the ordinary tests: 80 × 24 with the
+/// 16 × 32 px cells the emulated probe reports.
+const DEFAULT_GRID: (u16, u16, u16, u16) = (80, 24, 16, 32);
+
 impl PtyRun {
     fn spawn(args: &[&str], stdin_document: Option<&[u8]>, reply: ProbeReply, term: &str) -> Self {
         Self::spawn_in(None, args, stdin_document, reply, term)
@@ -517,7 +523,21 @@ impl PtyRun {
         reply: ProbeReply,
         term: &str,
     ) -> Self {
-        let pty = Pty::open(80, 24);
+        Self::spawn_sized(cwd, args, stdin_document, reply, term, DEFAULT_GRID)
+    }
+
+    /// Same pager session over a chosen PTY grid. The probe reply reports the
+    /// matching cell pixels so the live path derives the same CSS viewport a
+    /// real terminal would.
+    fn spawn_sized(
+        cwd: Option<&std::path::Path>,
+        args: &[&str],
+        stdin_document: Option<&[u8]>,
+        reply: ProbeReply,
+        term: &str,
+        (cols, rows, cell_w, cell_h): (u16, u16, u16, u16),
+    ) -> Self {
+        let pty = Pty::open(cols, rows);
 
         let (stdin_child, stdin_writer) = match stdin_document {
             Some(document) => {
@@ -572,7 +592,7 @@ impl PtyRun {
         if let Some(writer) = stdin_writer {
             writer.join().expect("stdin writer");
         }
-        let capture = Capture::start(pty.master, reply);
+        let capture = Capture::start(pty.master, reply, cell_w, cell_h);
         Self {
             pty,
             capture,
@@ -1466,4 +1486,148 @@ fn picker_empty_directory_shows_an_empty_state_and_exits() {
         "alternate screen left"
     );
     assert!(run.stderr().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Documentation capture harness
+// ---------------------------------------------------------------------------
+
+/// The last status row the pager wrote, as plain text.
+fn last_status_row(capture: &[u8], rows: u16) -> Option<String> {
+    let prefix = format!("\x1b[{rows};1H\x1b[2K").into_bytes();
+    let start = capture
+        .windows(prefix.len())
+        .rposition(|window| window == prefix)?;
+    let rest = &capture[start + prefix.len()..];
+    let end = rest
+        .iter()
+        .position(|&byte| byte == 0x1b)
+        .unwrap_or(rest.len());
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
+/// Live frames written by the pager, in write order.
+fn dumped_frames(dir: &Path) -> Vec<PathBuf> {
+    let mut frames: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+                .collect()
+        })
+        .unwrap_or_default();
+    frames.sort();
+    frames
+}
+
+/// Capture harness for the README click demo. It is not a behaviour test: it
+/// runs the real pager over the recorded 177 × 55 grid, sends SGR left-press
+/// reports at fixed cells, and writes the live frame PNGs plus the exact status
+/// rows the pager produced. Run it explicitly:
+///
+/// ```sh
+/// GLISK_CAPTURE_DIR=$PWD/target/capture-click \
+///   cargo test --test cli_e2e capture_click_demo_frames -- --ignored
+/// ```
+#[test]
+#[ignore = "capture harness: writes live frames and status rows to GLISK_CAPTURE_DIR"]
+fn capture_click_demo_frames() {
+    let out = PathBuf::from(
+        std::env::var("GLISK_CAPTURE_DIR")
+            .unwrap_or_else(|_| format!("{}/target/capture-click", env!("CARGO_MANIFEST_DIR"))),
+    );
+    let frames_dir = out.join("frames");
+    std::fs::create_dir_all(&frames_dir).expect("capture directory");
+    for stale in dumped_frames(&frames_dir) {
+        std::fs::remove_file(stale).expect("remove stale frame");
+    }
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/click-demo.html"
+    );
+
+    let mut run = PtyRun::spawn_sized(
+        None,
+        &[
+            fixture,
+            "--no-watch",
+            &format!("--dump-dir={}", frames_dir.display()),
+            &format!("--metrics={}", out.join("click.metrics").display()),
+        ],
+        None,
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+        (177, 55, 17, 34),
+    );
+    let timeout = Duration::from_secs(10);
+
+    assert!(
+        run.wait_for(b"glisk | 0%", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.capture.wait_for_after(0, b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    thread::sleep(Duration::from_millis(300));
+    let mut stages: Vec<(String, String, Vec<PathBuf>)> = Vec::new();
+    let record = |name: &str, stages: &mut Vec<(String, String, Vec<PathBuf>)>| {
+        let status = last_status_row(&run.capture.bytes(), 55).expect("status row");
+        stages.push((name.to_string(), status, dumped_frames(&frames_dir)));
+    };
+    record("report-open", &mut stages);
+
+    // Cell (10, 13) is inside the fragment link box drawn at CSS 204–272.
+    // The report is 1-based: column 11, row 14.
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;11;14M\x1b[<0;11;14m");
+    assert!(
+        run.capture.wait_for_after(mark, b"| jumped |", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    thread::sleep(Duration::from_millis(300));
+    record("fragment-click", &mut stages);
+
+    // The jump aligns the section top, so cell (10, 4) lands on the summary.
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;11;5M\x1b[<0;11;5m");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"| evidence expanded |", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    thread::sleep(Duration::from_millis(300));
+    record("disclosure-click", &mut stages);
+
+    run.keys(b"q");
+    assert!(
+        run.wait_exit(timeout).success(),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(run.stderr().is_empty());
+
+    // The frame counter is per-run, so each stage records the frame list and
+    // the manifest names the newest dump per stage.
+    let mut manifest = String::new();
+    manifest.push_str("# Glisk click capture\n");
+    manifest.push_str("grid=177x55\ncell=17x34\n");
+    for (name, status, frames) in &stages {
+        manifest.push_str(&format!("stage={name}\n"));
+        manifest.push_str(&format!("status={status}\n"));
+        match frames.last() {
+            Some(frame) => manifest.push_str(&format!("frame={}\n", frame.display())),
+            None => manifest.push_str("frame=missing\n"),
+        }
+    }
+    std::fs::write(out.join("capture.txt"), &manifest).expect("manifest");
+    assert_eq!(
+        dumped_frames(&frames_dir).len(),
+        3,
+        "expected one live frame per stage: {manifest}"
+    );
 }
