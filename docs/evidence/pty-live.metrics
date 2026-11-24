@@ -1,0 +1,12 @@
+mode=live
+term_program=tmux
+term=xterm-256color
+cell_width_px=8
+cell_height_px=16
+cols=2
+rows=2
+css_width=16.0
+css_height=16.0
+scale=1.000
+cold_start_to_frame_write_ms=404.6
+frames=1

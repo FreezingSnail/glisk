@@ -1,0 +1,9 @@
+mode=self-test
+anchor_scroll_y=988.0
+open_disclosure_after_resize=true
+focus_retained_after_resize=true
+resize_css_width=1000.0
+resize_css_height=896.0
+cold_start_to_self_test_ms=100.5
+result=pass
+peak_rss_bytes=25640960

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Glisk renderer decision report</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1419;
+    --card: #1b2430;
+    --card-2: #223040;
+    --ink: #e8eef5;
+    --muted: #a9b8c8;
+    --line: #3b4d60;
+    --accent: #71d6a8;
+    --accent-2: #f0c674;
+    --warn: #f29b8b;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); color: var(--ink); }
+  body {
+    margin: 0;
+    padding: 24px 20px 40px;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header { max-width: 980px; margin: 0 auto 22px; }
+  h1 { font-size: 30px; line-height: 1.15; margin: 0 0 8px; letter-spacing: -0.4px; }
+  h2 { font-size: 21px; margin: 0 0 10px; }
+  h3 { font-size: 17px; margin: 0 0 6px; }
+  p { margin: 0 0 10px; }
+  .lede { color: var(--muted); font-size: 17px; max-width: 760px; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .tag {
+    display: inline-block; padding: 2px 8px; margin: 0 6px 6px 0;
+    border: 1px solid var(--line); border-radius: 999px;
+    font-size: 12px; color: var(--accent); background: #12251f;
+  }
+  nav {
+    max-width: 980px; margin: 0 auto 22px; padding: 10px 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  }
+  nav a { color: var(--accent); margin-right: 16px; font-size: 14px; }
+  main { max-width: 980px; margin: 0 auto; }
+  section { margin: 0 0 26px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; }
+  .card {
+    flex: 1 1 260px; min-width: 0;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 15px;
+  }
+  .card p { color: var(--muted); font-size: 14px; margin: 0; }
+  .card .stat { font-size: 24px; color: var(--accent-2); font-weight: 700; margin-bottom: 2px; }
+  .tablewrap {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px; overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+  caption { caption-side: top; text-align: left; color: var(--muted); font-size: 13px; padding: 2px 2px 8px; }
+  th, td { text-align: left; vertical-align: top; padding: 7px 7px; border-bottom: 1px solid var(--line); overflow-wrap: break-word; }
+  th { color: var(--accent); font-size: 12px; letter-spacing: 0.4px; text-transform: uppercase; background: var(--card-2); }
+  tr:last-child td { border-bottom: 0; }
+  td.good { color: var(--accent); }
+  td.mid { color: var(--accent-2); }
+  td.bad { color: var(--warn); }
+  .chartbox {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 12px 10px;
+  }
+  .chartbox svg { display: block; width: 100%; height: auto; }
+  .caption { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .summary { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; }
+  .summary li { margin-bottom: 4px; }
+  details {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 0 14px 2px; margin: 0 0 10px;
+  }
+  summary { cursor: pointer; padding: 11px 0; font-weight: 700; color: var(--accent-2); }
+  details p, details ul { color: var(--muted); font-size: 14px; }
+  a { color: var(--accent); }
+  a:focus, summary:focus { outline: 3px solid var(--accent-2); outline-offset: 2px; }
+  code { font-family: Menlo, Monaco, monospace; font-size: 13px; color: var(--accent-2); background: #121a22; padding: 1px 4px; border-radius: 4px; }
+  .note { border-left: 3px solid var(--accent-2); padding-left: 10px; color: var(--muted); font-size: 14px; }
+  footer { max-width: 980px; margin: 30px auto 0; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  @media (max-width: 640px) {
+    body { padding: 16px 12px 32px; font-size: 15px; }
+    h1 { font-size: 25px; }
+    nav a { display: inline-block; margin-bottom: 4px; }
+    table { font-size: 12px; }
+    th, td { padding: 6px 4px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Glisk renderer decision report</h1>
+  <p class="lede">Which renderer should power a live HTML pager inside Ghostty? This report compares the v0 candidates and records the evidence needed before the viewer is built around one engine.</p>
+  <p>
+    <span class="tag">Decision report</span>
+    <span class="tag">Ghostty 1.4+</span>
+    <span class="tag">macOS</span>
+    <span class="tag">No JavaScript</span>
+  </p>
+  <p class="meta">Fixture for bead glisk-2hp.1 · author: Glisk spike · status: prototype</p>
+</header>
+
+<nav aria-label="Report sections">
+  <a href="#summary">Summary</a>
+  <a href="#comparison">Comparison</a>
+  <a href="#chart">Startup chart</a>
+  <a href="#evidence">Evidence</a>
+  <a href="#risks">Risks</a>
+</nav>
+
+<main>
+  <section id="summary">
+    <h2>Summary</h2>
+    <div class="cards">
+      <article class="card">
+        <h3>Recommended path</h3>
+        <p>Blitz with the Vello CPU rasterizer keeps the document model and the renderer in one Rust process. That is the only candidate that can preserve disclosure and focus state while reflowing on terminal resize.</p>
+      </article>
+      <article class="card">
+        <div class="stat">One</div>
+        <h3>Viewport-sized image</h3>
+        <p>The terminal receives one Kitty image placement per redraw. The raster stays at viewport size even when the document is many screens tall.</p>
+      </article>
+      <article class="card">
+        <div class="stat">Offline</div>
+        <h3>Resource policy</h3>
+        <p>The document gets its own HTML and embedded assets. Network fetches, secondary files, and navigation away from the document are denied before layout.</p>
+      </article>
+    </div>
+    <p class="note">Decision: continue with Blitz + Vello CPU only if the pinned build renders the cards, the headered table, and the inline SVG chart at both tested widths and survives keyboard interaction and resize. The measurements below are the comparison baseline.</p>
+  </section>
+
+  <section id="comparison">
+    <h2>Comparison</h2>
+    <div class="tablewrap">
+      <table>
+        <caption>Candidate renderers for the Glisk v0 pager. Lower startup is better; fidelity is judged on the reference report.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Option</th>
+            <th scope="col">Layout fidelity</th>
+            <th scope="col">Weight and latency</th>
+            <th scope="col">Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Blitz + Vello CPU</strong></td>
+            <td class="good">Embedded HTML/CSS, flex, grid, partial tables, inline SVG</td>
+            <td class="mid">Large Rust binary; CPU raster per frame</td>
+            <td class="good">Selected for v0</td>
+          </tr>
+          <tr>
+            <td><strong>Headless Chrome</strong></td>
+            <td class="good">Full browser behavior</td>
+            <td class="bad">External Chrome; about 0.5 s warm and 1.2 s cold for a trivial page</td>
+            <td class="mid">Scripted documents later</td>
+          </tr>
+          <tr>
+            <td><strong>Native TUI browser</strong></td>
+            <td class="mid">Own CSS engine, terminal-native text</td>
+            <td class="mid">Medium to heavy; different interaction model</td>
+            <td class="mid">Reference only</td>
+          </tr>
+          <tr>
+            <td><strong>HTML to ANSI text</strong></td>
+            <td class="bad">No real CSS layout; text stays selectable</td>
+            <td class="good">Cheap and fast</td>
+            <td class="mid">Plain-text fallback</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="chart">
+    <h2>Startup and redraw budget</h2>
+    <div class="chartbox">
+      <svg viewBox="0 0 640 230" role="img" aria-labelledby="chartTitle chartDesc">
+        <title id="chartTitle">Startup latency comparison</title>
+        <desc id="chartDesc">Bar chart of cold startup in milliseconds: Blitz spike target 120, headless Chrome warm 520, headless Chrome cold 1230. A dashed line marks the 250 millisecond target.</desc>
+        <rect x="0" y="0" width="640" height="230" fill="#1b2430"/>
+        <line x1="120" y1="20" x2="120" y2="190" stroke="#3b4d60" stroke-width="1"/>
+        <line x1="120" y1="190" x2="620" y2="190" stroke="#3b4d60" stroke-width="1"/>
+        <line x1="220" y1="20" x2="220" y2="190" stroke="#3b4d60" stroke-width="1" stroke-dasharray="4 4"/>
+        <text x="126" y="34" fill="#a9b8c8" font-size="12">0 ms</text>
+        <text x="224" y="34" fill="#a9b8c8" font-size="12">250 ms target</text>
+        <text x="10" y="62" fill="#e8eef5" font-size="13">Blitz spike target</text>
+        <rect x="120" y="48" width="60" height="22" fill="#71d6a8" rx="3"/>
+        <text x="190" y="64" fill="#71d6a8" font-size="12">120 ms</text>
+        <text x="10" y="104" fill="#e8eef5" font-size="13">Chrome warm</text>
+        <rect x="120" y="90" width="250" height="22" fill="#f0c674" rx="3"/>
+        <text x="380" y="106" fill="#f0c674" font-size="12">520 ms</text>
+        <text x="10" y="146" fill="#e8eef5" font-size="13">Chrome cold</text>
+        <rect x="120" y="132" width="420" height="22" fill="#f29b8b" rx="3"/>
+        <text x="548" y="148" fill="#f29b8b" font-size="12">1230 ms</text>
+        <text x="120" y="214" fill="#a9b8c8" font-size="12">Measured on the spike host; Blitz value is the target until the live run is recorded.</text>
+      </svg>
+      <p class="caption">Figure 1. Cold startup comparison for the candidate renderers, in milliseconds. The dashed line is the 250 ms interactive target for the spike.</p>
+      <ul class="summary">
+        <li>Blitz must keep cold startup and first frame under the dashed 250 ms target.</li>
+        <li>Headless Chrome warm startup is already above that target by roughly 2x.</li>
+        <li>Cold Chrome startup is about 5x the target and requires a separate browser process.</li>
+        <li>The chart is decorative once the text summary is present; color is not the only encoding.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <h2>Evidence</h2>
+    <details id="evidence-method">
+      <summary>Evidence 1: how the renderer was exercised</summary>
+      <p>The pinned prototype loads this same file with external fetches denied. It resolves layout at a narrow CSS viewport and at a wide CSS viewport, paints each viewport with Vello CPU, and writes a PNG frame before sending it to the terminal.</p>
+      <ul>
+        <li>Keyboard: Tab and Shift+Tab move focus; Enter follows a fragment link or toggles the focused disclosure.</li>
+        <li>Resize: geometry is measured again, the viewport is re-laid out, and the reading position, focus, and open disclosures are kept.</li>
+        <li>Exit: the image is deleted, raw mode is disabled, and the alternate screen is left before the shell prompt returns.</li>
+      </ul>
+      <p>Any value not observed in a live Ghostty run is marked unverified in the spike notes instead of being estimated as measured.</p>
+    </details>
+    <details id="evidence-gaps">
+      <summary>Evidence 2: known gaps and resolution conditions</summary>
+      <p>Blitz has no JavaScript and supports only part of the table and overflow model. The report therefore uses flex-wrapped cards, a fixed-layout table, and an inline SVG chart rather than scripted widgets or sticky headers.</p>
+      <ul>
+        <li>If the headered table paints without header text, the acceptance condition is a pinned Blitz build that paints table headers, or a documented CSS fallback using grid rows.</li>
+        <li>If a narrow viewport clips the table, the condition is a verified alternate layout at the narrow width, not a horizontal scroll assumption.</li>
+        <li>If foreground input or resize replies cannot be separated from keys, the condition is a single owner that buffers replies and keys with a shared deadline.</li>
+      </ul>
+    </details>
+  </section>
+
+  <section id="risks">
+    <h2>Risks</h2>
+    <div class="cards">
+      <article class="card">
+        <h3>Rasterized text</h3>
+        <p>Terminal selection and screen readers cannot read an image. Search and a plain-text mode must use the same document walk that produces the report text.</p>
+      </article>
+      <article class="card">
+        <h3>Geometry</h3>
+        <p>Cell pixels differ by display scale. Measure cell geometry on the target and derive CSS size from measured pixels rather than assuming a Retina factor.</p>
+      </article>
+      <article class="card">
+        <h3>Payload growth</h3>
+        <p>Keep the raster viewport-sized, cap the encoded frame, and replace one image ID instead of accumulating placements.</p>
+      </article>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Glisk reference fixture · inline CSS, inline SVG, no external assets, no script · reproduce with the commands in docs/renderer-spike.md.</p>
+</footer>
+</body>
+</html>
