@@ -14,6 +14,8 @@
 //! Integration note: this module is not wired into `src/main.rs` yet. See
 //! `docs/viewport.md` for the exact calls the wiring bead adds.
 
+use std::time::Duration;
+
 use anyrender_vello_cpu::VelloCpuScenePainter;
 use blitz_dom::{BaseDocument, NodeId};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
@@ -315,6 +317,7 @@ struct Block {
 /// One live document plus viewport state.
 pub struct Viewport {
     document: BaseDocument,
+    animation_time: Duration,
     geometry: Option<ViewGeometry>,
     problem: Option<GeometryProblem>,
     pending_anchor: Option<Anchor>,
@@ -332,6 +335,7 @@ impl Viewport {
         let mut viewport = Self {
             scroll_y: document.viewport_scroll().y,
             document,
+            animation_time: Duration::ZERO,
             geometry: None,
             problem: None,
             pending_anchor: None,
@@ -365,6 +369,18 @@ impl Viewport {
         &mut self.document
     }
 
+    pub fn advance_animation(&mut self, elapsed: Duration) {
+        self.animation_time += elapsed;
+    }
+
+    pub fn resolve(&mut self) {
+        self.document.resolve(self.animation_time.as_secs_f64());
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.document.is_animating()
+    }
+
     pub fn limits(&self) -> ViewportLimits {
         self.limits
     }
@@ -382,7 +398,7 @@ impl Viewport {
     pub fn max_scroll(&mut self) -> f64 {
         match self.geometry {
             Some(geometry) => {
-                self.document.resolve(0.0);
+                self.resolve();
                 self.max_scroll_for(geometry)
             }
             None => 0.0,
@@ -426,7 +442,7 @@ impl Viewport {
         let Some(geometry) = self.geometry else {
             return false;
         };
-        self.document.resolve(0.0);
+        self.resolve();
         self.set_scroll(target_css.clamp(0.0, self.max_scroll_for(geometry)))
     }
 
@@ -468,7 +484,7 @@ impl Viewport {
     /// Capture the top visible content block and its offset for a later reflow.
     pub fn capture_anchor(&mut self) -> Option<Anchor> {
         let geometry = self.geometry?;
-        self.document.resolve(0.0);
+        self.resolve();
         let blocks = collect_blocks(&self.document);
         let selected = self.select_visible_block(&blocks)?;
         let index = blocks
@@ -491,7 +507,7 @@ impl Viewport {
     /// The top visible content block for the current layout.
     pub fn visible_block(&mut self) -> Option<VisibleBlock> {
         self.geometry?;
-        self.document.resolve(0.0);
+        self.resolve();
         let blocks = collect_blocks(&self.document);
         self.select_visible_block(&blocks)
     }
@@ -520,7 +536,7 @@ impl Viewport {
             return Ok(PaintOutcome::Skipped(SkipReason::EmptyDocument));
         }
 
-        self.document.resolve(0.0);
+        self.resolve();
         self.set_scroll(self.scroll_y.clamp(0.0, self.max_scroll_for(geometry)));
 
         let (width, height) = geometry.physical_size();
@@ -556,7 +572,7 @@ impl Viewport {
 
     fn apply_geometry(&mut self, geometry: ViewGeometry) {
         self.document.set_viewport(geometry.blitz());
-        self.document.resolve(0.0);
+        self.resolve();
     }
 
     fn apply_anchor(&mut self, anchor: Option<Anchor>, geometry: ViewGeometry) -> ResizeInfo {

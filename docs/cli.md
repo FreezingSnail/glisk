@@ -77,14 +77,19 @@ stdin, `--text`, and offline local HTML behavior are unchanged.
 
 | Key | Action |
 |---|---|
-| Arrows, `j`/`k` | Scroll one step. |
+| Arrows, `j`/`k`, wheel/trackpad | Scroll one step. |
 | Page Up/Down, Space | Scroll one page. |
 | `g`/`G`, Home/End | Top or bottom. |
+| Left-click | Follow a visible fragment link or toggle a visible disclosure summary at its rendered position. The clicked control keeps keyboard focus. |
 | Tab / Shift+Tab | Move focus among visible fragment links and disclosure summaries. |
 | Enter | Follow the focused fragment or toggle the focused disclosure. |
 | `/`, `n`, `N` | Open search, then next/previous match. |
 | Escape | Cancel the search prompt, preserving the previous query and position. |
 | `q`, Ctrl+C | Finish and restore the terminal. |
+
+Mouse reporting is enabled with the live view and released on quit, Ctrl+C, and
+handled errors. Clicks on the status row, ordinary content, and external links
+are ignored; only same-document fragment links and disclosure summaries activate.
 
 Resize is read from the terminal owner's `TIOCGWINSZ` path; the viewport reflows
 with its block anchor, so reading position, focus, and open disclosures survive.

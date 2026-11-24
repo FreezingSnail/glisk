@@ -764,6 +764,18 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
     let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
     assert_eq!(screen.matches('\u{10EEEE}').count(), 80 * 23);
 
+    // Send a terminal mouse report to the attached tmux client, so tmux has
+    // to route it to Glisk and translate it to pane coordinates.
+    // SAFETY: the duplicate is owned by this File.
+    let mut client_input = unsafe { std::fs::File::from_raw_fd(dup(pty.master)) };
+    client_input.write_all(b"\x1b[<64;2;2M").unwrap();
+    assert!(
+        capture.wait_for(Duration::from_secs(5), |bytes| {
+            contains(&bytes[scrolled.len()..], b"\x1b_Ga=f,f=100,")
+        }),
+        "wheel input from the tmux client must scroll the pager"
+    );
+
     // A pane resize changes the grid dimensions and must rebuild the cells.
     pty.resize(72, 20);
     // SAFETY: the client is the foreground process of this PTY.
@@ -914,6 +926,16 @@ fn ctrl_c_restores_the_tmux_pane() {
         thread::sleep(Duration::from_millis(100));
     }
     assert!(restored, "Ctrl+C must restore the pane's shell");
+    // tmux may reorder its own mouse-tracking reset, so check each mode.
+    let snapshot = capture.snapshot();
+    assert!(
+        contains(&snapshot, b"\x1b[?1000l"),
+        "Ctrl+C must disable button-event tracking in the pane"
+    );
+    assert!(
+        contains(&snapshot, b"\x1b[?1006l"),
+        "Ctrl+C must disable SGR mouse encoding in the pane"
+    );
     let _ = client.kill();
     let _ = client.wait();
 }

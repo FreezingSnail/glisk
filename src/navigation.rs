@@ -4,8 +4,8 @@
 //! contract: one live [`Viewport`] document from [`crate::viewport`].
 //!
 //! The module enumerates eligible controls in document order, keeps keyboard
-//! focus on the live DOM, and turns Enter into either a same-document fragment
-//! jump or a disclosure toggle. [`show_fragment`] and [`reveal_node`] are the
+//! focus on the live DOM, and handles fragment jumps and disclosure toggles
+//! from Enter or a mouse click. [`show_fragment`] and [`reveal_node`] are the
 //! central reveal-and-jump entry points; the later search bead reuses them for
 //! matches inside closed disclosures.
 //!
@@ -203,35 +203,33 @@ fn visit(document: &BaseDocument, id: NodeId, out: &mut Vec<Control>) {
     let Some(node) = document.get_node(id) else {
         return;
     };
-    if let Some(tag) = tag_of(node) {
-        if is_non_content(tag) {
-            return;
-        }
-        let control = match tag {
-            "a" => node
-                .attr(local_name!("href"))
-                .and_then(|href| href.strip_prefix('#'))
-                .map(|fragment| Control {
-                    node: id,
-                    kind: ControlKind::FragmentLink,
-                    fragment: Some(fragment.to_string()),
-                }),
-            "summary" if is_disclosure_summary(document, node) => Some(Control {
-                node: id,
-                kind: ControlKind::DisclosureSummary,
-                fragment: None,
-            }),
-            _ => None,
-        };
-        if let Some(control) = control
-            && is_visible(document, node)
-        {
-            out.push(control);
-        }
+    if tag_of(node).is_some_and(is_non_content) {
+        return;
+    }
+    if let Some(control) = visible_control(document, node) {
+        out.push(control);
     }
     for &child in &node.children {
         visit(document, child, out);
     }
+}
+
+fn visible_control(document: &BaseDocument, node: &Node) -> Option<Control> {
+    let (kind, fragment) = match tag_of(node)? {
+        "a" => (
+            ControlKind::FragmentLink,
+            Some(node.attr(local_name!("href"))?.strip_prefix('#')?),
+        ),
+        "summary" if is_disclosure_summary(document, node) => {
+            (ControlKind::DisclosureSummary, None)
+        }
+        _ => return None,
+    };
+    is_visible(document, node).then(|| Control {
+        node: node.id,
+        kind,
+        fragment: fragment.map(str::to_owned),
+    })
 }
 
 /// Follow a same-document fragment, revealing enclosing closed disclosures.
@@ -257,16 +255,15 @@ pub fn show_fragment(viewport: &mut Viewport, fragment: &str) -> FragmentJump {
 /// scrolled through [`Viewport::scroll_to`] so `Viewport::scroll_y` and the live
 /// document stay in sync.
 pub fn reveal_node(viewport: &mut Viewport, node: NodeId) -> Result<RevealOutcome, RevealError> {
-    let document = viewport.document_mut();
-    if document.get_node(node).is_none() {
+    if viewport.document().get_node(node).is_none() {
         return Err(RevealError { node });
     }
-    document.resolve(0.0);
-    let opened = open_hidden_ancestors(document, node);
+    viewport.resolve();
+    let opened = open_hidden_ancestors(viewport.document_mut(), node);
     if !opened.is_empty() {
-        document.resolve(0.0);
+        viewport.resolve();
     }
-    let top = document_top(document, node);
+    let top = document_top(viewport.document(), node);
     let aligned = top.is_some();
     let target = top.unwrap_or(viewport.scroll_y());
     viewport.scroll_to(target);
@@ -278,7 +275,7 @@ pub fn reveal_node(viewport: &mut Viewport, node: NodeId) -> Result<RevealOutcom
     })
 }
 
-/// Keyboard focus traversal and activation over one live viewport.
+/// Focus traversal and activation over one live viewport.
 ///
 /// Focus itself is stored on the `BaseDocument` through
 /// [`BaseDocument::set_focus_to`], so resize and reflow retain it. The struct
@@ -299,7 +296,7 @@ impl Navigation {
 
     /// Eligible visible controls in document order after resolving layout.
     pub fn controls(&self, viewport: &mut Viewport) -> Vec<Control> {
-        viewport.document_mut().resolve(0.0);
+        viewport.resolve();
         controls(viewport.document())
     }
 
@@ -368,25 +365,50 @@ impl Navigation {
 
     /// Activate the focused control: follow a fragment or toggle a disclosure.
     pub fn activate(&mut self, viewport: &mut Viewport) -> NavigationStatus {
-        let Some(control) = self.focused_control(viewport) else {
+        if let Some(control) = self.focused_control(viewport) {
+            self.activate_control(viewport, &control);
+        } else {
             self.status = NavigationStatus::NoFocus;
-            return self.status.clone();
+        }
+        self.status.clone()
+    }
+
+    /// Focus and activate the control hit by a viewport-relative CSS point.
+    pub fn click(&mut self, viewport: &mut Viewport, x: f32, y: f32) -> bool {
+        viewport.resolve();
+        let document = viewport.document();
+        // Blitz's hit tester takes document coordinates and adjusts for fixed boxes.
+        let Some(hit) = document.hit(x, y + viewport.scroll_y() as f32) else {
+            return false;
         };
+        let control = document
+            .node_chain(hit.node_id)
+            .into_iter()
+            .find_map(|id| visible_control(document, document.get_node(id)?));
+        let Some(control) = control else {
+            return false;
+        };
+        viewport.document_mut().set_focus_to(control.node);
+        self.activate_control(viewport, &control);
+        true
+    }
+
+    fn activate_control(&mut self, viewport: &mut Viewport, control: &Control) {
         self.status = match control.kind {
             ControlKind::DisclosureSummary => {
                 let Some(details) = enclosing_details(viewport.document(), control.node) else {
                     self.status = NavigationStatus::NotLocalLink;
-                    return self.status.clone();
+                    return;
                 };
                 viewport.document_mut().toggle_details_open(details);
-                viewport.document_mut().resolve(0.0);
+                viewport.resolve();
                 let open = is_open(viewport.document(), details);
                 NavigationStatus::Toggled { details, open }
             }
             ControlKind::FragmentLink => {
                 let Some(fragment) = control.fragment() else {
                     self.status = NavigationStatus::NotLocalLink;
-                    return self.status.clone();
+                    return;
                 };
                 match show_fragment(viewport, fragment) {
                     FragmentJump::Jumped(outcome) => NavigationStatus::Jumped {
@@ -400,7 +422,6 @@ impl Navigation {
                 }
             }
         };
-        self.status.clone()
     }
 
     /// Fragment jump with status tracking; used by the pager and future search.
@@ -430,9 +451,8 @@ impl Navigation {
 }
 
 fn reveal_nearest(viewport: &mut Viewport, node: NodeId) {
-    let document = viewport.document_mut();
-    document.resolve(0.0);
-    let Some(target) = document.get_node(node) else {
+    viewport.resolve();
+    let Some(target) = viewport.document().get_node(node) else {
         return;
     };
     let Some(bounds) = bounds_of(target) else {

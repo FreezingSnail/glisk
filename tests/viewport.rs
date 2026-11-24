@@ -7,6 +7,8 @@
 #[path = "../src/viewport.rs"]
 mod viewport;
 
+use std::time::Duration;
+
 use blitz_dom::{BaseDocument, DocumentConfig, LocalName, Namespace, QualName, local_name};
 use blitz_html::HtmlDocument;
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
@@ -77,6 +79,24 @@ fn png_size(png: &[u8]) -> (u32, u32) {
 
 fn approx(actual: f64, expected: f64, tolerance: f64) -> bool {
     (actual - expected).abs() <= tolerance
+}
+
+#[test]
+fn css_animations_change_the_rendered_frame_as_the_clock_advances() {
+    let html = include_str!("../examples/animated-cache.html");
+    let config = DocumentConfig {
+        viewport: Some(BlitzViewport::new(420, 360, 1.0, ColorScheme::Dark)),
+        ..Default::default()
+    };
+    let mut document = HtmlDocument::from_html(html, config).into_inner();
+    document.resolve(0.0);
+    let mut viewport = Viewport::new(document, 420, 360, 1.0);
+    let initial = painted(&mut viewport).png;
+    assert!(viewport.is_animating());
+
+    viewport.advance_animation(Duration::from_millis(750));
+    let later = painted(&mut viewport).png;
+    assert_ne!(later, initial, "keyframes should move the diagram markers");
 }
 
 #[test]

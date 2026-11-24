@@ -1,20 +1,20 @@
-# Keyboard navigation, fragment jumps, and disclosures
+# Keyboard and mouse navigation, fragment jumps, and disclosures
 
-Bead: `glisk-2hp.5` · module: `src/navigation.rs` · tests:
+Beads: `glisk-2hp.5`, `glisk-2hp.14` · module: `src/navigation.rs` · tests:
 `tests/navigation.rs` · spec:
 `FEASIBILITY.md#navigation-and-search`
 
 The module makes native fragment links and disclosure summaries operable in the
 terminal. It enumerates eligible visible controls in document order, moves focus
-on Tab and Shift+Tab, follows a decoded same-document fragment on Enter, toggles
-the focused disclosure, and reports an unknown fragment without changing the
-view. Focus and disclosure state stay on the live Blitz document, so a viewport
-resize and reflow keep both useful.
+on Tab and Shift+Tab, follows a decoded same-document fragment on Enter or a
+left click, toggles the focused disclosure, and reports an unknown fragment
+without changing the view. Focus and disclosure state stay on the live Blitz
+document, so a viewport resize and reflow keep both useful.
 
 The module is wired into the pager by bead `glisk-2hp.8`: `src/main.rs`
-maps Tab/Shift+Tab/Enter to the [`Navigation`] methods. The integration test
-still includes both modules with `#[path = "../src/viewport.rs"]` and
-`#[path = "../src/navigation.rs"]`.
+maps Tab/Shift+Tab/Enter and SGR mouse reports to the [`Navigation`] methods.
+The integration test still includes both modules with
+`#[path = "../src/viewport.rs"]` and `#[path = "../src/navigation.rs"]`.
 
 ## Contract
 
@@ -29,6 +29,9 @@ let indicator = nav.focus_indicator(&mut viewport);
 // Enter
 nav.activate(&mut viewport);
 
+// Left click at a viewport-relative CSS point
+nav.click(&mut viewport, x, y);
+
 // Search or pager reveal, without moving focus
 navigation::show_fragment(&mut viewport, "#target%20id");
 navigation::reveal_node(&mut viewport, matched_block_node)?;
@@ -40,6 +43,7 @@ navigation::reveal_node(&mut viewport, matched_block_node)?;
 | `Navigation::focused_control` | The focused control when DOM focus currently sits on an eligible visible one. |
 | `Navigation::focus_indicator` | App-owned `FocusIndicator`: node, kind, document-relative `Rect`, and whether the rect intersects the current viewport. Use it for a status-row cue or overlay. |
 | `Navigation::activate` | Enter. A fragment link calls `show_fragment`; a summary toggles its enclosing `<details>`. Returns the new `NavigationStatus`. |
+| `Navigation::click` | Left click. Resolve layout, hit-test the viewport-relative point plus the current scroll offset, find the nearest eligible control on the hit node chain, focus it, and share `activate`'s fragment/toggle path. Ordinary content, external links, and non-control ancestors return `false` without changing the view. |
 | `Navigation::jump_to_fragment` / `reveal` | Status-tracking wrappers for the pager and later search. `reveal` does not change focus. |
 | `navigation::controls(&BaseDocument)` | Eligible controls in document order. Callers must resolve layout first; the methods above do. |
 | `navigation::show_fragment(&mut Viewport, fragment)` | Decode the fragment, find the exact `id`, open hiding disclosures, and scroll the target to the viewport top. Unknown ids return `UnknownFragment` before any scroll or mutation. |
@@ -63,6 +67,13 @@ status row.
 Document order is the DOM order, not the CSS visual order. Enumeration is
 recomputed from the live DOM on each traversal or activation, so opening or
 closing a disclosure immediately changes the Tab order.
+
+Mouse hit testing uses the center of the reported terminal cell in
+viewport-relative CSS pixels plus the current scroll offset. Blitz resolves that
+document point to a node; the click walks the node chain to the nearest visible
+eligible control, focuses it, and activates it once. A control is never
+activated by a release report. Positions outside the content grid, including
+the status row, are rejected before hit testing.
 
 ## Fragment jumps and reveal
 

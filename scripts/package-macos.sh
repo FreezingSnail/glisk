@@ -24,6 +24,7 @@ mkdir -p "$out/docs" "$out/examples"
 install -m 0755 target/release/glisk "$out/glisk"
 install -m 0755 target/release/glisk dist/glisk
 install -m 0644 examples/decision-report.html "$out/examples/decision-report.html"
+install -m 0644 examples/animated-cache.html "$out/examples/animated-cache.html"
 install -m 0644 docs/authoring.md "$out/docs/authoring.md"
 install -m 0644 docs/cli.md "$out/docs/cli.md"
 

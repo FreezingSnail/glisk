@@ -29,12 +29,14 @@ use clap::Parser;
 use document::{IngestError, IngestedDocument, Limits};
 use navigation::Navigation;
 use search::Search;
-use terminal::{TerminalConfig, TerminalError, TerminalOwner};
+use terminal::{Geometry, TerminalConfig, TerminalError, TerminalOwner};
 use viewport::{PaintOutcome, ResizeOutcome, Viewport as DocViewport};
 
 const MAX_RASTER_PIXELS: u64 = 8_388_608;
 const TEXT_VIEWPORT_WIDTH: u32 = 420;
 const TEXT_VIEWPORT_HEIGHT: u32 = 900;
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const SCROLL_STEP: f64 = 40.0;
 
 #[derive(Parser, Debug)]
 #[command(name = "glisk", about = "Glisk HTML pager", version)]
@@ -45,6 +47,10 @@ struct Args {
     /// Write plain UTF-8 text instead of opening the live pager.
     #[arg(long)]
     text: bool,
+
+    /// Open the live pager with animations paused.
+    #[arg(long)]
+    pause_animation: bool,
 
     /// Diagnostic: write one viewport PNG to this path.
     #[arg(long, hide = true)]
@@ -190,6 +196,7 @@ struct Pager {
     view: DocViewport,
     navigation: Navigation,
     search: Search,
+    animation_paused: bool,
     frames: u32,
     metrics: Metrics,
 }
@@ -200,6 +207,7 @@ impl Pager {
             view: DocViewport::new(document, width, height, scale),
             navigation: Navigation::new(),
             search: Search::new(),
+            animation_paused: false,
             frames: 0,
             metrics: Metrics::new(),
         }
@@ -213,7 +221,7 @@ impl Pager {
                 .get_element_by_id(id)
                 .ok_or_else(|| format!("no element with id {id:?}"))?;
             self.view.document_mut().toggle_details_open(node);
-            self.view.document_mut().resolve(0.0);
+            self.view.resolve();
         }
         if let Some(selector) = &args.focus {
             let node = self
@@ -223,7 +231,7 @@ impl Pager {
                 .map_err(|err| format!("bad selector {selector:?}: {err:?}"))?
                 .ok_or_else(|| format!("no element matches {selector:?}"))?;
             self.view.document_mut().set_focus_to(node);
-            self.view.document_mut().resolve(0.0);
+            self.view.resolve();
             self.view.document_mut().scroll_into_view(
                 node,
                 ScrollBehavior::Instant,
@@ -239,7 +247,7 @@ impl Pager {
                 return Err(format!("no fragment target {fragment:?}"));
             }
         }
-        self.view.document_mut().resolve(0.0);
+        self.view.resolve();
         Ok(())
     }
 
@@ -288,8 +296,15 @@ impl Pager {
         } else {
             100.0
         };
+        let animation_status = if self.animation_paused {
+            " | paused (p)"
+        } else if self.view.is_animating() {
+            " | playing (p)"
+        } else {
+            ""
+        };
         format!(
-            "glisk | {percent:.0}% | {} | {} | Tab focus  Enter open  / search  j/k scroll  q quit",
+            "glisk | {percent:.0}%{animation_status} | {} | {} | Tab focus  Enter open  / search  j/k scroll  q quit",
             self.search.status(),
             self.navigation.status()
         )
@@ -308,6 +323,7 @@ impl Pager {
         self.metrics
             .push("term", &std::env::var("TERM").unwrap_or_default());
 
+        self.animation_paused = args.pause_animation;
         self.draw(owner, args)?;
         self.metrics.push(
             "cold_start_to_frame_write_ms",
@@ -331,26 +347,25 @@ impl Pager {
             return Ok(());
         }
 
+        let mut last_sample = Instant::now();
+        let mut last_frame = last_sample;
         loop {
-            let batch = owner
-                .poll_input(Duration::from_millis(100))
-                .map_err(terminal_message)?;
+            let timeout = if self.animation_active(owner) {
+                ANIMATION_FRAME_INTERVAL.saturating_sub(last_frame.elapsed())
+            } else {
+                Duration::from_millis(100)
+            };
+            let batch = owner.poll_input(timeout).map_err(terminal_message)?;
             let mut changed = false;
             let mut quit = false;
-
-            if let Some(batch) = batch {
-                if batch.interrupt {
-                    quit = true;
-                } else {
-                    for key in parse_keys(&batch.bytes) {
-                        changed |= self.handle_key(key, &mut quit);
-                    }
-                }
+            let now = Instant::now();
+            if !self.animation_paused {
+                self.view.advance_animation(now.duration_since(last_sample));
             }
-            if quit {
-                break;
-            }
+            last_sample = now;
 
+            // Resolve a pending terminal resize before mapping mouse reports,
+            // so a click always uses the grid that produced the visible frame.
             if let Some(geometry) = owner.refresh_size().map_err(terminal_message)? {
                 let (width, height) = geometry.physical_size();
                 if matches!(
@@ -360,13 +375,30 @@ impl Pager {
                     changed = true;
                 }
             }
+
+            if let Some(batch) = batch {
+                if batch.interrupt {
+                    quit = true;
+                } else {
+                    for input in parse_input(&batch.bytes) {
+                        changed |= self.handle_input(input, owner.geometry(), &mut quit);
+                    }
+                }
+            }
+            if quit {
+                break;
+            }
             if owner.take_repaint_request() {
                 self.metrics.count("tmux_repaints");
                 changed = true;
             }
 
-            if changed {
+            if changed
+                || (self.animation_active(owner)
+                    && last_frame.elapsed() >= ANIMATION_FRAME_INTERVAL)
+            {
                 self.draw(owner, args)?;
+                last_frame = Instant::now();
             }
         }
 
@@ -375,59 +407,80 @@ impl Pager {
         self.metrics.write(args.metrics.as_deref())
     }
 
-    fn handle_key(&mut self, key: Key, quit: &mut bool) -> bool {
+    fn animation_active(&self, owner: &TerminalOwner) -> bool {
+        !self.animation_paused
+            && self.view.geometry().is_some()
+            && owner.tmux_visible() != Some(false)
+            && self.view.is_animating()
+    }
+
+    fn handle_input(&mut self, input: Input, geometry: Geometry, quit: &mut bool) -> bool {
         if self.search.is_editing() {
-            return match key {
-                Key::Enter => {
+            return match input {
+                Input::Enter => {
                     let text = text::extract(self.view.document());
                     self.search
                         .commit(&text, &mut self.view, &mut self.navigation);
                     true
                 }
-                Key::Escape => {
+                Input::Escape => {
                     self.search.cancel();
                     true
                 }
-                Key::Backspace => self.search.backspace(),
-                Key::Char(ch) => self.search.push_char(ch),
+                Input::Backspace => self.search.backspace(),
+                Input::Char(ch) => self.search.push_char(ch),
                 _ => false,
             };
         }
 
-        match key {
-            Key::Char('q') => {
+        match input {
+            Input::Char('q') => {
                 *quit = true;
                 false
             }
-            Key::Char('j') | Key::Down => self.view.scroll_by(40.0),
-            Key::Char('k') | Key::Up => self.view.scroll_by(-40.0),
-            Key::Char(' ') | Key::PageDown => self.view.scroll_page(1.0),
-            Key::PageUp => self.view.scroll_page(-1.0),
-            Key::Char('g') | Key::Home => self.view.scroll_home(),
-            Key::Char('G') | Key::End => self.view.scroll_end(),
-            Key::Tab => {
+            Input::Char('j') | Input::Down => self.view.scroll_by(SCROLL_STEP),
+            Input::Char('k') | Input::Up => self.view.scroll_by(-SCROLL_STEP),
+            Input::Char(' ') | Input::PageDown => self.view.scroll_page(1.0),
+            Input::PageUp => self.view.scroll_page(-1.0),
+            Input::Char('g') | Input::Home => self.view.scroll_home(),
+            Input::Char('G') | Input::End => self.view.scroll_end(),
+            Input::Char('p') => {
+                self.animation_paused = !self.animation_paused;
+                true
+            }
+            Input::Tab => {
                 self.navigation.focus_next(&mut self.view);
                 true
             }
-            Key::BackTab => {
+            Input::BackTab => {
                 self.navigation.focus_prev(&mut self.view);
                 true
             }
-            Key::Enter => {
+            Input::Enter => {
                 self.navigation.activate(&mut self.view);
                 true
             }
-            Key::Char('/') => {
+            Input::Char('/') => {
                 self.search.begin();
                 true
             }
-            Key::Char('n') => {
+            Input::Char('n') => {
                 self.search.next(&mut self.view, &mut self.navigation);
                 true
             }
-            Key::Char('N') => {
+            Input::Char('N') => {
                 self.search.previous(&mut self.view, &mut self.navigation);
                 true
+            }
+            Input::Mouse { action, col, row } => {
+                let Some((x, y)) = geometry.content_cell_center(col, row) else {
+                    return false;
+                };
+                match action {
+                    MouseAction::LeftPress => self.navigation.click(&mut self.view, x, y),
+                    MouseAction::WheelUp => self.view.scroll_by(-SCROLL_STEP),
+                    MouseAction::WheelDown => self.view.scroll_by(SCROLL_STEP),
+                }
             }
             _ => false,
         }
@@ -474,7 +527,7 @@ impl Pager {
             ScriptedAction::Toggle(id) => {
                 if let Some(node) = self.view.document().get_element_by_id(id) {
                     self.view.document_mut().toggle_details_open(node);
-                    self.view.document_mut().resolve(0.0);
+                    self.view.resolve();
                 }
             }
         }
@@ -565,11 +618,18 @@ impl ScriptedAction {
 }
 
 // ---------------------------------------------------------------------------
-// Input keys
+// Terminal input
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Key {
+enum MouseAction {
+    LeftPress,
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
     Escape,
     Enter,
     Tab,
@@ -584,20 +644,25 @@ enum Key {
     Home,
     End,
     Char(char),
+    Mouse {
+        action: MouseAction,
+        col: u16,
+        row: u16,
+    },
     Unknown,
 }
 
-/// Parse the ordinary key bytes returned by the terminal owner. The owner has
+/// Parse the keyboard and mouse bytes returned by the terminal owner. It has
 /// already separated protocol replies and retained incomplete sequences, so
 /// every escape sequence here is complete.
-fn parse_keys(bytes: &[u8]) -> Vec<Key> {
-    let mut keys = Vec::new();
+fn parse_input(bytes: &[u8]) -> Vec<Input> {
+    let mut events = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             0x1b => {
                 if i + 1 >= bytes.len() {
-                    keys.push(Key::Escape);
+                    events.push(Input::Escape);
                     i += 1;
                     continue;
                 }
@@ -609,64 +674,66 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                             end += 1;
                         }
                         if end >= bytes.len() {
-                            keys.push(Key::Unknown);
+                            events.push(Input::Unknown);
                             break;
                         }
                         let params = &bytes[start..end];
-                        keys.push(match bytes[end] {
-                            b'A' => Key::Up,
-                            b'B' => Key::Down,
-                            b'C' => Key::Right,
-                            b'D' => Key::Left,
-                            b'H' => Key::Home,
-                            b'F' => Key::End,
-                            b'Z' => Key::BackTab,
-                            b'~' => match params {
-                                b"1" | b"7" => Key::Home,
-                                b"4" | b"8" => Key::End,
-                                b"5" => Key::PageUp,
-                                b"6" => Key::PageDown,
-                                b"3" => Key::Backspace,
-                                _ => Key::Unknown,
+                        events.push(match (params.strip_prefix(b"<"), bytes[end]) {
+                            (Some(report), b'M') => parse_mouse(report).unwrap_or(Input::Unknown),
+                            (Some(_), _) => Input::Unknown,
+                            (None, b'A') => Input::Up,
+                            (None, b'B') => Input::Down,
+                            (None, b'C') => Input::Right,
+                            (None, b'D') => Input::Left,
+                            (None, b'H') => Input::Home,
+                            (None, b'F') => Input::End,
+                            (None, b'Z') => Input::BackTab,
+                            (None, b'~') => match params {
+                                b"1" | b"7" => Input::Home,
+                                b"4" | b"8" => Input::End,
+                                b"5" => Input::PageUp,
+                                b"6" => Input::PageDown,
+                                b"3" => Input::Backspace,
+                                _ => Input::Unknown,
                             },
-                            _ => Key::Unknown,
+                            _ => Input::Unknown,
                         });
                         i = end + 1;
                     }
                     b'O' => {
                         if i + 2 >= bytes.len() {
-                            keys.push(Key::Escape);
+                            events.push(Input::Escape);
                             i += 1;
                             continue;
                         }
-                        keys.push(match bytes[i + 2] {
-                            b'A' => Key::Up,
-                            b'B' => Key::Down,
-                            b'C' => Key::Right,
-                            b'D' => Key::Left,
-                            b'H' => Key::Home,
-                            b'F' => Key::End,
-                            _ => Key::Unknown,
+                        events.push(match bytes[i + 2] {
+                            b'A' => Input::Up,
+                            b'B' => Input::Down,
+                            b'C' => Input::Right,
+                            b'D' => Input::Left,
+                            b'H' => Input::Home,
+                            b'F' => Input::End,
+                            _ => Input::Unknown,
                         });
                         i += 3;
                     }
                     _ => {
                         // Alt+key: report Escape, then the key on the next pass.
-                        keys.push(Key::Escape);
+                        events.push(Input::Escape);
                         i += 1;
                     }
                 }
             }
             b'\t' => {
-                keys.push(Key::Tab);
+                events.push(Input::Tab);
                 i += 1;
             }
             b'\r' | b'\n' => {
-                keys.push(Key::Enter);
+                events.push(Input::Enter);
                 i += 1;
             }
             0x7f | 0x08 => {
-                keys.push(Key::Backspace);
+                events.push(Input::Backspace);
                 i += 1;
             }
             _ => {
@@ -677,12 +744,28 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
                     i += 1;
                 }
                 for ch in String::from_utf8_lossy(&bytes[start..i]).chars() {
-                    keys.push(Key::Char(ch));
+                    events.push(Input::Char(ch));
                 }
             }
         }
     }
-    keys
+    events
+}
+
+fn parse_mouse(report: &[u8]) -> Option<Input> {
+    let mut fields = std::str::from_utf8(report).ok()?.split(';');
+    let action = match fields.next()? {
+        "0" => MouseAction::LeftPress,
+        "64" => MouseAction::WheelUp,
+        "65" => MouseAction::WheelDown,
+        _ => return None,
+    };
+    let col = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    let row = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(Input::Mouse { action, col, row })
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,23 +1106,53 @@ mod tests {
 
     #[test]
     fn parses_navigation_and_search_keys() {
-        let keys = parse_keys(b"\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[Z\t\r/abc\x7f\x1b");
+        let keys = parse_input(b"\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[Z\t\r/abc\x7f\x1b");
         assert_eq!(
             keys,
             vec![
-                Key::Up,
-                Key::Down,
-                Key::PageUp,
-                Key::PageDown,
-                Key::BackTab,
-                Key::Tab,
-                Key::Enter,
-                Key::Char('/'),
-                Key::Char('a'),
-                Key::Char('b'),
-                Key::Char('c'),
-                Key::Backspace,
-                Key::Escape,
+                Input::Up,
+                Input::Down,
+                Input::PageUp,
+                Input::PageDown,
+                Input::BackTab,
+                Input::Tab,
+                Input::Enter,
+                Input::Char('/'),
+                Input::Char('a'),
+                Input::Char('b'),
+                Input::Char('c'),
+                Input::Backspace,
+                Input::Escape,
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_mouse_presses_and_wheel_reports() {
+        let inputs = parse_input(
+            b"\x1b[<0;12;5M\x1b[<0;12;5m\x1b[<64;1;1M\x1b[<65;80;24M\x1b[<32;2;2M\x1b[<0;0;1M",
+        );
+        assert_eq!(
+            inputs,
+            vec![
+                Input::Mouse {
+                    action: MouseAction::LeftPress,
+                    col: 11,
+                    row: 4,
+                },
+                Input::Unknown,
+                Input::Mouse {
+                    action: MouseAction::WheelUp,
+                    col: 0,
+                    row: 0,
+                },
+                Input::Mouse {
+                    action: MouseAction::WheelDown,
+                    col: 79,
+                    row: 23,
+                },
+                Input::Unknown,
+                Input::Unknown,
             ]
         );
     }

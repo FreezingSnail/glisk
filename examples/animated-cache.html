@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>How a cache saves a round trip</title>
+<style>
+  :root { color-scheme: dark; background: #121921; color: #edf3f7; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 690px; margin: 0 auto; padding: 24px 18px; }
+  h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.15; }
+  p { margin: 0 0 16px; color: #c1ccd6; }
+  figure { margin: 0 0 16px; padding: 12px; border: 1px solid #344452;
+           border-radius: 12px; background: #1a2530; }
+  .lanes { position: relative; }
+  .lanes svg { display: block; width: 100%; height: 104px; }
+  .marker { position: absolute; left: 0; width: 100%; height: 12px;
+            transform: translateX(-40%); }
+  .marker span { display: block; width: 12px; height: 12px; margin: 0 auto;
+                 border-radius: 50%; background: #f4fbff; }
+  .hit { top: 20px; animation: hit 5s linear infinite; }
+  .miss { top: 72px; animation: miss 5s linear infinite; }
+  @keyframes hit {
+    0% { transform: translateX(-40%); }
+    20%, 100% { transform: translateX(40%); }
+  }
+  @keyframes miss {
+    0% { transform: translateX(-40%); }
+    20%, 32% { transform: translateX(0%); }
+    62%, 100% { transform: translateX(40%); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .marker { animation: none; }
+  }
+  figcaption { margin: 0 4px; color: #c1ccd6; font-size: 14px; }
+  .hit-label { color: #71dfbd; }
+  .miss-label { color: #f4bf73; }
+</style>
+</head>
+<body>
+<main>
+  <h1>How a cache saves a round trip</h1>
+  <p>A cache hit returns a stored response. On a miss, the cache waits for the origin before replying.</p>
+  <figure>
+    <div class="lanes">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 104"
+           preserveAspectRatio="none" role="img">
+        <title>Request paths on a cache hit and miss</title>
+        <desc>The upper route goes straight to the response. The lower route pauses at the origin.</desc>
+        <path d="M40 26H360" stroke="#71dfbd" stroke-width="3"/>
+        <path d="M40 78H360" stroke="#f4bf73" stroke-width="3" stroke-dasharray="5 4"/>
+        <path d="M40 18v16m320-16v16" stroke="#71dfbd" stroke-width="2"/>
+        <path d="M40 70v16m160-16v16m160-16v16" stroke="#f4bf73" stroke-width="2"/>
+        <rect x="195" y="68" width="10" height="20" rx="3" fill="#f4bf73"/>
+      </svg>
+      <div class="marker hit" aria-hidden="true"><span></span></div>
+      <div class="marker miss" aria-hidden="true"><span></span></div>
+    </div>
+    <figcaption>
+      <strong class="hit-label">Top: cache hit.</strong> Request → response.<br>
+      <strong class="miss-label">Bottom: cache miss.</strong> Request → origin → response.
+    </figcaption>
+  </figure>
+  <p>The movement shows the order of events. The timing is illustrative.</p>
+</main>
+</body>
+</html>

@@ -4,8 +4,8 @@
 //!
 //! - confirming that the input and output file descriptors refer to the same TTY;
 //! - a bounded, shared-budget Ghostty/Kitty graphics + cell-pixel probe;
-//! - raw mode and the alternate screen;
-//! - retaining ordinary key bytes typed while probe replies are parsed;
+//! - raw mode, the alternate screen, and cell-based SGR mouse reporting;
+//! - retaining input bytes while probe replies are parsed;
 //! - transmitting a viewport PNG as one Kitty image with a stable image ID,
 //!   explicit cell geometry, cursor preservation, and bounded chunking;
 //! - painting one reserved status row above/below that geometry;
@@ -77,10 +77,10 @@ fn png_raster_size(png: &[u8]) -> Option<(u32, u32)> {
 }
 const SAVE_CURSOR: &[u8] = b"\x1b7";
 const RESTORE_CURSOR: &[u8] = b"\x1b8";
-const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
-const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
-const ENTER_ALT: &[u8] = b"\x1b[?1049h";
-const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+// Button events and wheel reports, encoded as SGR cell coordinates. These
+// sequences go to the pane itself in tmux, just like the alternate screen.
+const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1006h\x1b[?1000h";
+const LEAVE_SCREEN: &[u8] = b"\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -435,6 +435,16 @@ impl Geometry {
 
     pub fn css_size(self) -> (f64, f64) {
         (self.css_w, self.css_h)
+    }
+
+    /// Center of a zero-based content cell in viewport-relative CSS pixels.
+    pub fn content_cell_center(self, col: u16, row: u16) -> Option<(f32, f32)> {
+        if col >= self.cols || row >= self.content_rows {
+            return None;
+        }
+        let x = (f64::from(col) + 0.5) * self.css_w / f64::from(self.cols);
+        let y = (f64::from(row) + 0.5) * self.css_h / f64::from(self.content_rows);
+        Some((x as f32, y as f32))
     }
 
     pub fn scale(self) -> f64 {
@@ -1114,7 +1124,7 @@ fn probe_terminal(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputBatch {
-    /// Ordinary key bytes, exactly as read, with interrupt bytes removed.
+    /// Keyboard and mouse bytes, exactly as read, with interrupt bytes removed.
     pub bytes: Vec<u8>,
     /// A raw `0x03` was read (raw mode turns Ctrl+C into this byte).
     pub interrupt: bool,
@@ -1175,8 +1185,6 @@ pub struct TerminalOwner {
     /// Incomplete escape sequence retained between reads.
     input_buffer: Vec<u8>,
     image_owned: bool,
-    alternate_active: bool,
-    cursor_hidden: bool,
     finished: bool,
     /// Last bounded tmux visibility/geometry re-check.
     tmux_last_sync: Instant,
@@ -1297,14 +1305,9 @@ impl TerminalOwner {
             }
         };
 
-        if let Err(err) =
-            write_fd(output_fd, ENTER_ALT).and_then(|_| write_fd(output_fd, HIDE_CURSOR))
-        {
+        if let Err(err) = Self::enter_screen(output_fd) {
             let _ = restore_termios(input_fd, &saved);
-            return Err(TerminalError::Io {
-                op: "enter alternate screen",
-                source: err,
-            });
+            return Err(err);
         }
 
         let image_id = config.image_id;
@@ -1327,8 +1330,6 @@ impl TerminalOwner {
             keys_pending: pending_keys,
             input_buffer: Vec::new(),
             image_owned: false,
-            alternate_active: true,
-            cursor_hidden: true,
             finished: false,
             tmux_last_sync: Instant::now(),
             tmux_repaint: false,
@@ -1384,14 +1385,9 @@ impl TerminalOwner {
         let saved =
             read_termios(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
         set_raw(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
-        if let Err(err) =
-            write_fd(output_fd, ENTER_ALT).and_then(|_| write_fd(output_fd, HIDE_CURSOR))
-        {
+        if let Err(err) = Self::enter_screen(output_fd) {
             let _ = restore_termios(input_fd, &saved);
-            return Err(TerminalError::Io {
-                op: "enter alternate screen",
-                source: err,
-            });
+            return Err(err);
         }
 
         // tmux detection already validated exactly one attached Ghostty 1.4+
@@ -1416,8 +1412,6 @@ impl TerminalOwner {
             keys_pending: Vec::new(),
             input_buffer: Vec::new(),
             image_owned: false,
-            alternate_active: true,
-            cursor_hidden: true,
             finished: false,
             tmux_last_sync: Instant::now(),
             tmux_repaint: false,
@@ -1636,7 +1630,7 @@ impl TerminalOwner {
         }
     }
 
-    /// Poll for key input. Probe replies that arrive late are consumed; ordinary
+    /// Poll for keyboard and mouse input. Late probe replies are consumed; ordinary
     /// bytes are returned unchanged. A `0x03` byte sets [`InputBatch::interrupt`]
     /// and is removed from `bytes`; the caller must then quit and call
     /// [`Self::finish`] (or drop the owner).
@@ -1888,9 +1882,20 @@ impl TerminalOwner {
         })
     }
 
-    /// Explicit cleanup: delete the owned image, show the cursor, leave the
-    /// alternate screen, and restore saved termios. Idempotent and called from
-    /// `Drop` as a backstop.
+    fn enter_screen(output_fd: RawFd) -> Result<(), TerminalError> {
+        write_fd(output_fd, ENTER_SCREEN).map_err(|source| {
+            // A short write can leave some of the terminal modes enabled.
+            let _ = write_fd(output_fd, LEAVE_SCREEN);
+            TerminalError::Io {
+                op: "enter alternate screen",
+                source,
+            }
+        })
+    }
+
+    /// Delete the owned image, disable mouse reporting, show the cursor, leave
+    /// the alternate screen, and restore saved termios. Idempotent and called
+    /// from `Drop` as a backstop.
     pub fn finish(&mut self) -> Result<(), TerminalError> {
         if self.finished {
             return Ok(());
@@ -1909,20 +1914,9 @@ impl TerminalOwner {
             }
             self.image_owned = false;
         }
-        if self.cursor_hidden {
-            sequence.extend_from_slice(SHOW_CURSOR);
-            self.cursor_hidden = false;
-        }
-        if self.alternate_active {
-            sequence.extend_from_slice(LEAVE_ALT);
-            self.alternate_active = false;
-        }
+        sequence.extend_from_slice(LEAVE_SCREEN);
 
-        let write_result = if sequence.is_empty() {
-            Ok(())
-        } else {
-            write_fd(self.output_fd, &sequence)
-        };
+        let write_result = write_fd(self.output_fd, &sequence);
         let restore_result = match self.saved_termios.take() {
             Some(saved) => restore_termios(self.input_fd, &saved),
             None => Ok(()),

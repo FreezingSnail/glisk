@@ -36,11 +36,26 @@ Verified by the reference report and the renderer spike:
 - Native `<details><summary>` disclosures, optionally with `open`.
 - A visible focus style such as `a:focus, summary:focus { outline: ... }`.
 - `@media (max-width: 640px)` rules for the narrow viewport.
+- CSS keyframe animations on HTML elements, including moving markers over a
+  static SVG diagram. See `examples/animated-cache.html`.
 
 Avoid JavaScript, external resources, `overflow:auto` scrolling regions,
 `position:sticky`, generated content that carries meaning, and fixed widths
 larger than the viewport. They are outside the verified subset. Tables and
 cards should wrap rather than force horizontal scrolling.
+
+## Animated diagrams
+
+Use inline `@keyframes` to show a sequence or comparison. Keep a static SVG
+for the diagram and animate an HTML layer above it, such as a marker following
+one of its paths. The cache example compares a hit with a miss by pausing the
+second marker at the origin. Its caption explains the paths when playback is
+paused and in plain-text output.
+
+Keep the animation self-contained. The pager advances CSS animations while
+the live view is open. Press `p` to pause or resume from the current point,
+or pass `--pause-animation` to open on the initial frame. Text mode and
+diagnostic snapshots use the initial animation state.
 
 ## Skeleton
 
@@ -98,9 +113,11 @@ cards should wrap rather than force horizontal scrolling.
 
 | Action | Result |
 |---|---|
-| Arrows, `j`/`k`, Page Up/Down | Scroll a step or page. |
+| Arrows, `j`/`k`, wheel/trackpad, Page Up/Down | Scroll a step or page. |
+| Left-click | Follow a visible fragment link or toggle a visible disclosure summary; focus stays on the clicked control. |
 | Tab, Shift+Tab | Move visible focus through fragment links and disclosure summaries. |
 | Enter | Follow the focused fragment link or toggle its disclosure. |
+| `p` | Pause or resume animations. |
 | `/`, `n`, `N` | Search all semantic text and cycle matches; a match inside a closed disclosure opens it. |
 | Resize | Reflow at the new width and keep the reading position, focus, and open disclosures. |
 | `q`, Ctrl+C | Delete the image and restore the terminal. |

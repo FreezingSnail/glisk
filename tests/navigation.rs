@@ -86,6 +86,29 @@ fn is_open(viewport: &Viewport, id: NodeId) -> bool {
         .is_some_and(|node| node.data.has_attr(local_name!("open")))
 }
 
+fn click_point(viewport: &mut Viewport, node: NodeId) -> (f32, f32) {
+    viewport.resolve();
+    let rect = viewport
+        .document()
+        .get_client_bounding_rect(node)
+        .expect("rendered control rect");
+    (
+        (rect.x + rect.width / 2.0) as f32,
+        (rect.y + rect.height / 2.0) as f32,
+    )
+}
+
+fn scroll_node_near_top(viewport: &mut Viewport, node: NodeId) {
+    viewport.resolve();
+    let top = viewport
+        .document()
+        .get_node(node)
+        .expect("target node")
+        .absolute_position(0.0, 0.0)
+        .y as f64;
+    viewport.scroll_to((top - 8.0).max(0.0));
+}
+
 fn target_visible(viewport: &mut Viewport, target: NodeId) -> bool {
     let (_, height) = viewport.geometry().expect("geometry").css_size();
     let top = f64::from(
@@ -236,6 +259,97 @@ fn enter_toggles_a_disclosure_and_keeps_focus_on_the_live_dom() {
             open: false
         }
     );
+    assert!(!is_open(&viewport, outer));
+}
+
+#[test]
+fn clicks_activate_rendered_controls_and_ignore_other_targets() {
+    let mut viewport = viewport(200, 120);
+    let external = element(&viewport, "external");
+    let first = element(&viewport, "first");
+    let outer = element(&viewport, "outer");
+    let outer_summary = element(&viewport, "outer-summary");
+    let mut nav = Navigation::new();
+
+    let (x, y) = click_point(&mut viewport, external);
+    assert!(
+        !nav.click(&mut viewport, x, y),
+        "external links are ignored"
+    );
+    assert_eq!(nav.status(), &NavigationStatus::Idle);
+
+    assert!(
+        !nav.click(&mut viewport, 5.0, 4.0),
+        "ordinary content has no control"
+    );
+    assert_eq!(nav.status(), &NavigationStatus::Idle);
+
+    scroll_node_near_top(&mut viewport, outer_summary);
+    let (x, y) = click_point(&mut viewport, outer_summary);
+    assert!(nav.click(&mut viewport, x, y));
+    assert!(is_open(&viewport, outer));
+    assert_eq!(
+        nav.status(),
+        &NavigationStatus::Toggled {
+            details: outer,
+            open: true
+        }
+    );
+    assert_eq!(
+        viewport.document().get_focussed_node_id(),
+        Some(outer_summary),
+        "the clicked summary keeps keyboard focus"
+    );
+
+    let (x, y) = click_point(&mut viewport, outer_summary);
+    assert!(nav.click(&mut viewport, x, y));
+    assert!(!is_open(&viewport, outer));
+    assert_eq!(
+        nav.status(),
+        &NavigationStatus::Toggled {
+            details: outer,
+            open: false
+        }
+    );
+
+    // Enter continues from the control the click focused.
+    assert_eq!(
+        nav.activate(&mut viewport),
+        NavigationStatus::Toggled {
+            details: outer,
+            open: true
+        }
+    );
+
+    viewport.scroll_home();
+    let (x, y) = click_point(&mut viewport, first);
+    assert!(nav.click(&mut viewport, x, y));
+    let NavigationStatus::Jumped { node, fragment, .. } = nav.status() else {
+        panic!("expected a fragment jump, got {:?}", nav.status());
+    };
+    assert_eq!(*node, element(&viewport, "target id"));
+    assert_eq!(fragment, "target id");
+    assert_eq!(viewport.document().get_focussed_node_id(), Some(first));
+}
+
+#[test]
+fn click_positions_follow_reflow_after_resize() {
+    let mut viewport = viewport(220, 130);
+    let outer = element(&viewport, "outer");
+    let outer_summary = element(&viewport, "outer-summary");
+    let mut nav = Navigation::new();
+
+    scroll_node_near_top(&mut viewport, outer_summary);
+    let (x, y) = click_point(&mut viewport, outer_summary);
+    assert!(nav.click(&mut viewport, x, y));
+    assert!(is_open(&viewport, outer));
+
+    let ResizeOutcome::Applied(_) = viewport.resize(150, 140, 1.0) else {
+        panic!("valid resize was skipped");
+    };
+    scroll_node_near_top(&mut viewport, outer_summary);
+    let (x, y) = click_point(&mut viewport, outer_summary);
+    assert!(nav.click(&mut viewport, x, y));
     assert!(!is_open(&viewport, outer));
 }
 

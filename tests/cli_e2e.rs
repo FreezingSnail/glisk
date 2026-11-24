@@ -73,6 +73,24 @@ fn file_text_output_is_plain_and_complete() {
 }
 
 #[test]
+fn animated_example_text_keeps_the_visual_explanation() {
+    let output = command(&[
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/animated-cache.html"),
+        "--text",
+    ])
+    .output()
+    .expect("run");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_plain(&output.stdout);
+    let text = String::from_utf8(output.stdout).expect("UTF-8");
+    assert!(text.contains("Top: cache hit. Request → response."), "{text}");
+    assert!(
+        text.contains("Bottom: cache miss. Request → origin → response."),
+        "{text}"
+    );
+}
+
+#[test]
 fn stdin_text_output_matches_file_output() {
     let file = command(&[FIXTURE, "--text"]).output().expect("file run");
     assert!(file.status.success());
@@ -438,6 +456,36 @@ impl Capture {
             .filter(|window| *window == needle)
             .count()
     }
+
+    fn len(&self) -> usize {
+        self.data.lock().unwrap().len()
+    }
+
+    fn count_after(&self, start: usize, needle: &[u8]) -> usize {
+        let data = self.data.lock().unwrap();
+        data.get(start..)
+            .unwrap_or_default()
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+
+    fn wait_for_after(&self, start: usize, needle: &[u8], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let data = self.data.lock().unwrap();
+            if data.len() > start
+                && data[start..]
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            {
+                return true;
+            }
+            drop(data);
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
 }
 
 impl Drop for Capture {
@@ -668,6 +716,190 @@ fn live_pager_handles_navigation_search_resize_and_quit() {
         "live run diagnostics: {}",
         String::from_utf8_lossy(&stderr)
     );
+}
+
+#[test]
+fn live_pager_scrolls_and_activates_controls_with_mouse_input() {
+    // The fragment targets the surrounding section, so the reveal does not
+    // open the disclosure. The click below therefore starts from the closed
+    // state that a reader sees.
+    let document = br##"<!doctype html>
+        <style>
+            body { margin: 0 }
+            a, summary, p { display: block; font: 16px/32px sans-serif; margin: 0 }
+        </style>
+        <div style="height:380px"></div>
+        <a href="#panel"><span>Jump to details</span></a>
+        <div style="height:388px"></div>
+        <section id="panel"><details id="evidence"><summary>Evidence</summary><p>Revealed text</p><a href="https://example.com/report">External link</a></details></section>
+        <div style="height:800px"></div>"##;
+    let timeout = Duration::from_secs(5);
+    let mut run = PtyRun::spawn(
+        &["-"],
+        Some(document),
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+    );
+    assert!(
+        run.wait_for(b"glisk | 0%", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(run.wait_for(b"\x1b[?1006h\x1b[?1000h", timeout));
+
+    // At 40 CSS pixels of scroll, the link covers content row 23. A report
+    // split across reads must survive, and the status row (24) must ignore
+    // wheel input.
+    let frames = run.capture.count(b"\x1b_Ga=");
+    run.keys(b"\x1b[<65;2;");
+    thread::sleep(Duration::from_millis(120));
+    run.keys(b"2M");
+    assert!(
+        run.wait_for_frames_after(frames, timeout),
+        "split wheel report must scroll: {}",
+        describe_capture(&run.capture)
+    );
+    let frames = run.capture.count(b"\x1b_Ga=");
+    run.keys(b"\x1b[<65;2;24M");
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        run.capture.count(b"\x1b_Ga="),
+        frames,
+        "status-row wheel input must be ignored"
+    );
+
+    // One press activates once; the release in the same physical click is
+    // ignored rather than activating a second time.
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;2;23M\x1b[<0;2;23m");
+    assert!(
+        run.capture.wait_for_after(mark, b"jumped", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        run.capture.count_after(mark, b"jumped"),
+        1,
+        "the release must not activate the link again"
+    );
+
+    // The fragment reveal aligned the section top. Clicking the summary opens
+    // the disclosure, and focus stays on the summary for Enter to close it.
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;2;2M\x1b[<0;2;2m");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"evidence expanded", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    let mark = run.capture.len();
+    run.keys(b"\r");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"evidence collapsed", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    // A second click reopens from the closed state and activates once.
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;2;2M\x1b[<0;2;2m");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"evidence expanded", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    // Ordinary content, an external link, and the status row are ignored.
+    let frames = run.capture.count(b"\x1b_Ga=");
+    run.keys(b"\x1b[<0;2;3M\x1b[<0;2;6M\x1b[<0;2;24M");
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        run.capture.count(b"\x1b_Ga="),
+        frames,
+        "ineligible clicks must not redraw or activate"
+    );
+
+    // Wheel up and wheel down both scroll while the section stays aligned.
+    let frames = run.capture.count(b"\x1b_Ga=");
+    run.keys(b"\x1b[<64;2;2M");
+    assert!(
+        run.wait_for_frames_after(frames, timeout),
+        "wheel up must scroll"
+    );
+    let frames = run.capture.count(b"\x1b_Ga=");
+    run.keys(b"\x1b[<65;2;2M");
+    assert!(
+        run.wait_for_frames_after(frames, timeout),
+        "wheel down must scroll"
+    );
+
+    // Reflow at the new width and map the same control through the new grid.
+    run.resize(100, 30);
+    assert!(
+        run.wait_for(b",c=100,", timeout),
+        "resize repainted at the new width"
+    );
+    let mark = run.capture.len();
+    run.keys(b"\x1b[<0;2;2M\x1b[<0;2;2m");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"evidence collapsed", timeout),
+        "click after resize must use the new geometry: {}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
+    assert!(run.wait_for(b"\x1b[?1000l\x1b[?1006l", timeout));
+    assert!(run.wait_for(b"\x1b[?25h\x1b[?1049l", timeout));
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn live_animated_pager_pauses_and_resumes_without_input_redraws() {
+    let document = std::fs::read(format!(
+        "{}/examples/animated-cache.html",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("animated example");
+    let mut run = PtyRun::spawn(
+        &["-", "--pause-animation"],
+        Some(&document),
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+    );
+    let timeout = Duration::from_secs(5);
+    assert!(
+        run.wait_for(b"paused (p)", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    let paused_frames = run.capture.count(b"\x1b_Ga=T");
+    thread::sleep(Duration::from_millis(350));
+    assert_eq!(run.capture.count(b"\x1b_Ga=T"), paused_frames);
+
+    run.keys(b"p");
+    assert!(
+        run.wait_for(b"playing (p)", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.wait_for_frames_after(paused_frames + 1, timeout),
+        "animation should redraw without further input"
+    );
+
+    run.keys(b"p");
+    assert!(run.wait_for(b"paused (p)", timeout));
+    let resumed_frames = run.capture.count(b"\x1b_Ga=T");
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(run.capture.count(b"\x1b_Ga=T"), resumed_frames);
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
 }
 
 #[test]

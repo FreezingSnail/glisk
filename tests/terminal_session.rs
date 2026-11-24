@@ -362,6 +362,11 @@ fn probe_success_reports_geometry_and_retains_keys() {
     let config = probe_config(400);
     let mut owner = open_with_plan(&pty, config, ProbePlan::Success).expect("probe succeeds");
 
+    let entered = drain(pty.master);
+    assert!(contains(&entered, b"\x1b[?1049h"));
+    assert!(contains(&entered, b"\x1b[?1006h\x1b[?1000h"));
+    assert!(contains(&entered, b"\x1b[?25l"));
+
     let geometry = owner.geometry();
     assert_eq!(geometry.cols(), 80);
     assert_eq!(geometry.rows(), 24);
@@ -390,7 +395,19 @@ fn probe_success_reports_geometry_and_retains_keys() {
     let _environment = owner.environment();
 
     owner.finish().expect("finish");
+    let cleanup = drain(pty.master);
+    assert!(contains(&cleanup, b"\x1b[?1000l\x1b[?1006l"));
+    assert!(contains(&cleanup, b"\x1b[?25h\x1b[?1049l"));
     assert_modes_restored(&before, &get_termios(pty.slave));
+}
+
+#[test]
+fn geometry_maps_content_cells_to_css_centers() {
+    let geometry = Geometry::compute(80, 24, CellPixels::new(16, 32).unwrap(), 1).unwrap();
+    assert_eq!(geometry.content_cell_center(0, 0), Some((4.0, 8.0)));
+    assert_eq!(geometry.content_cell_center(79, 22), Some((636.0, 360.0)));
+    assert_eq!(geometry.content_cell_center(80, 0), None);
+    assert_eq!(geometry.content_cell_center(0, 23), None);
 }
 
 #[test]
@@ -724,6 +741,7 @@ fn cleanup_runs_after_interrupt_and_handled_error() {
         &cleanup,
         format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\").as_bytes()
     ));
+    assert!(contains(&cleanup, b"\x1b[?1000l\x1b[?1006l"));
     assert!(contains(&cleanup, b"\x1b[?25h"));
     assert!(contains(&cleanup, b"\x1b[?1049l"));
     assert_modes_restored(&before, &get_termios(pty.slave));
@@ -745,6 +763,7 @@ fn cleanup_runs_after_interrupt_and_handled_error() {
     assert_eq!(count(&drain(pty.master), b"a=T"), 0);
     owner.finish().expect("finish after error");
     let cleanup = drain(pty.master);
+    assert!(contains(&cleanup, b"\x1b[?1000l\x1b[?1006l"));
     assert!(contains(&cleanup, b"\x1b[?25h"));
     assert!(contains(&cleanup, b"\x1b[?1049l"));
     assert_modes_restored(&before, &get_termios(pty.slave));

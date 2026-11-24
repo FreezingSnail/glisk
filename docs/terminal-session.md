@@ -5,9 +5,9 @@ Bead: `glisk-2hp.3` · module: `src/terminal.rs` · tests:
 `FEASIBILITY.md#terminal-session-and-viewport`
 
 This module is the pager's single terminal owner. It owns TTY identity checks,
-the bounded capability/geometry probe, raw mode, the alternate screen, key
-input, Kitty graphics writes, resize geometry, and cleanup. It does not load or
-paint documents, own the keymap, or write plain-text output.
+the bounded capability/geometry probe, raw mode, the alternate screen, keyboard
+and SGR cell-mouse input, Kitty graphics writes, resize geometry, and cleanup.
+It does not load or paint documents, own the keymap, or write plain-text output.
 
 The module is wired into `src/main.rs` by bead `glisk-2hp.8`; the CLI
 opens it only after bounded ingestion and mode selection. The integration test
@@ -31,8 +31,8 @@ Call order for the pager:
    grid changed. If the font size changed, call `reprobe_cell()` and then
    `resize_with_cell(cols, rows, cell)`.
 6. Call `poll_input(timeout)` in the synchronous event loop. Feed
-   `InputBatch::bytes` to the pager keymap. If `InputBatch::interrupt` is true,
-   quit.
+   `InputBatch::bytes` to the pager keymap; complete SGR mouse reports arrive in
+   the same stream and may span reads. If `InputBatch::interrupt` is true, quit.
 7. Call `finish()` on normal quit, after `interrupt`, and on every handled error
    before printing diagnostics. `Drop` repeats the same cleanup as a backstop
    for early returns and unwinding.
@@ -53,15 +53,15 @@ same-terminal check. This is what makes
 |---|---|
 | `TerminalOwner::open()` / `open_with_config` | `stdout` must be a TTY. Inside tmux it first validates the pane/client (no probe); otherwise the shared cell/graphics probe confirms reads and writes reach the same terminal. Failure is an error, never a silent fallback. |
 | `TerminalOwner::from_fds(input, output, config)` | Same checks for already-open descriptors; neither descriptor is closed by the owner. Used by direct PTY tests; never selects tmux. |
-| `geometry()` | Validated grid, content rows above the status row, cell pixels, physical raster, CSS viewport, and derived scale. |
+| `geometry()` | Validated grid, content rows above the status row, cell pixels, physical raster, CSS viewport, and derived scale. `content_cell_center` maps a zero-based content cell to its center in viewport CSS pixels. |
 | `resize` / `resize_with_cell` | Recompute and validate; a failed resize leaves the previous geometry intact. |
 | `refresh_size()` | `TIOCGWINSZ`; in tmux also the bounded visibility/client re-check. Returns `None` when nothing changed. |
 | `take_repaint_request()` | True once after a tmux pane becomes visible again; the pager redraws its latest frame. |
 | `reprobe_cell()` | Repeat only the bounded `CSI 16t` query, retaining keys typed meanwhile. In tmux the measured client cell is retained instead. |
-| `poll_input(timeout)` | Returns ordinary key bytes unchanged, consumes late/foreign protocol replies, and reports `0x03` as `interrupt`. A lone Escape is returned as a key after an idle poll. |
+| `poll_input(timeout)` | Returns keyboard and SGR mouse bytes unchanged, consumes late/foreign protocol replies, and reports `0x03` as `interrupt`. A lone Escape is returned as a key after an idle poll. |
 | `present(png)` | First frame, changed raster/placement, and recovery use a full `a=T` transmit-and-place. Same-identity frames on a verified frame-editing renderer overwrite base frame 1 with `a=f,r=1,X=1`. tmux placeholder cells are written on the first frame and whenever the grid size changes. Size limits are checked before any write. |
 | `paint_status(text)` | Clears and writes the last row with the cursor preserved; strips escape sequences, C0/C1/DEL, and truncates to the grid width. |
-| `finish()` | Idempotent delete-image (raw or passthrough) + show-cursor + leave-alternate-screen + restore-termios sequence. |
+| `finish()` | Idempotent delete-image (raw or passthrough) + disable mouse reporting + show-cursor + leave-alternate-screen + restore-termios sequence. Entry requests SGR mouse reports (`?1006h` plus button event tracking `?1000h`) in the same pane output as the alternate screen; tmux options are never changed. |
 | `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `frame_editing_supported()`, `probe_report()` | Diagnostics and metrics. Environment values never choose the mode or geometry; the explicit Ghostty 1.4+ pair is the only frame-editing gate. |
 
 ## Mode outcomes

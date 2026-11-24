@@ -14,6 +14,10 @@ cargo build --release --locked
 cat examples/decision-report.html | ./target/release/glisk -
 ```
 
+Scroll with the wheel or trackpad, and left-click a visible fragment link or
+disclosure summary to follow or toggle it. The full keymap is in
+[`docs/cli.md`](docs/cli.md).
+
 Build and package the macOS bundle with the checked-in pinned lockfile:
 
 ```sh
