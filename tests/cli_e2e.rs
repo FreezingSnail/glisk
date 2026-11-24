@@ -382,6 +382,24 @@ enum ProbeReply {
     Timeout,
     GraphicsOk,
     GraphicsError,
+    /// Answer `CSI > 0 q` with this DCS `>|` body.
+    GraphicsWithIdentity(&'static str),
+    /// Same identity, split across two writes.
+    GraphicsWithSplitIdentity(&'static str),
+}
+
+impl ProbeReply {
+    fn identity(self) -> Option<&'static str> {
+        match self {
+            ProbeReply::GraphicsWithIdentity(body)
+            | ProbeReply::GraphicsWithSplitIdentity(body) => Some(body),
+            ProbeReply::Timeout | ProbeReply::GraphicsOk | ProbeReply::GraphicsError => None,
+        }
+    }
+
+    fn split_identity(self) -> bool {
+        matches!(self, ProbeReply::GraphicsWithSplitIdentity(_))
+    }
 }
 
 struct Capture {
@@ -397,31 +415,63 @@ impl Capture {
         let thread_data = Arc::clone(&data);
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            let mut answered = false;
+            let mut graphics_answered = false;
+            let mut identity_answered = false;
+            let mut saw_cell = false;
+            let mut saw_graphics = false;
+            let mut saw_query = false;
+            // Scan only the new bytes plus a small overlap so query detection
+            // does not rescan (and clone) the whole capture on every read.
+            let mut tail: Vec<u8> = Vec::new();
             while !thread_stop.load(Ordering::SeqCst) {
                 let chunk = read_some(master, Duration::from_millis(5));
                 if chunk.is_empty() {
                     continue;
                 }
                 thread_data.lock().unwrap().extend_from_slice(&chunk);
-                if answered || matches!(reply, ProbeReply::Timeout) {
+                if matches!(reply, ProbeReply::Timeout) {
                     continue;
                 }
-                let seen = thread_data.lock().unwrap().clone();
-                let saw_cell = seen.windows(5).any(|window| window == b"\x1b[16t");
-                let saw_graphics = seen.windows(5).any(|window| window == b"\x1b_Gi=");
-                if saw_cell && saw_graphics {
-                    let response = match reply {
-                        ProbeReply::GraphicsOk => {
-                            format!("\x1b_Gi=31;OK\x1b\\\x1b[6;{cell_h};{cell_w}t").into_bytes()
+                let mut scan = std::mem::take(&mut tail);
+                scan.extend_from_slice(&chunk);
+                let has = |needle: &[u8]| scan.windows(needle.len()).any(|window| window == needle);
+                saw_cell |= has(b"\x1b[16t");
+                saw_graphics |= has(b"\x1b_Gi=");
+                saw_query |= has(b"\x1b[>0q");
+                let keep = 7.min(scan.len());
+                tail = scan[scan.len() - keep..].to_vec();
+                if !graphics_answered {
+                    if saw_cell && saw_graphics {
+                        let response = match reply {
+                            ProbeReply::GraphicsOk
+                            | ProbeReply::GraphicsWithIdentity(_)
+                            | ProbeReply::GraphicsWithSplitIdentity(_) => {
+                                format!("\x1b_Gi=31;OK\x1b\\\x1b[6;{cell_h};{cell_w}t").into_bytes()
+                            }
+                            ProbeReply::GraphicsError => b"\x1b_Gi=31;EINVAL\x1b\\".to_vec(),
+                            ProbeReply::Timeout => Vec::new(),
+                        };
+                        if !response.is_empty() {
+                            write_master(master, &response);
                         }
-                        ProbeReply::GraphicsError => b"\x1b_Gi=31;EINVAL\x1b\\".to_vec(),
-                        ProbeReply::Timeout => Vec::new(),
-                    };
-                    if !response.is_empty() {
-                        write_master(master, &response);
+                        graphics_answered = true;
                     }
-                    answered = true;
+                }
+                if graphics_answered && !identity_answered {
+                    if saw_query {
+                        if let Some(body) = reply.identity() {
+                            let response = format!("\x1bP>|{body}\x1b\\").into_bytes();
+                            if reply.split_identity() {
+                                let split = response.len() / 2;
+                                write_master(master, &response[..split]);
+                                thread::sleep(Duration::from_millis(20));
+                                write_master(master, &response[split..]);
+                            } else {
+                                write_master(master, &response);
+                            }
+                        }
+                        identity_answered = true;
+                    }
                 }
             }
         });
@@ -535,7 +585,51 @@ impl PtyRun {
         stdin_document: Option<&[u8]>,
         reply: ProbeReply,
         term: &str,
+        grid: (u16, u16, u16, u16),
+    ) -> Self {
+        Self::spawn_with_hints(
+            cwd,
+            args,
+            stdin_document,
+            reply,
+            term,
+            grid,
+            Some("glisk-test"),
+        )
+    }
+
+    /// `term_program` controls the capability hints the child sees. `None`
+    /// removes both Ghostty program variables, leaving only `term`.
+    fn spawn_with_hints(
+        cwd: Option<&std::path::Path>,
+        args: &[&str],
+        stdin_document: Option<&[u8]>,
+        reply: ProbeReply,
+        term: &str,
+        grid: (u16, u16, u16, u16),
+        term_program: Option<&str>,
+    ) -> Self {
+        Self::spawn_with_program_hints(
+            cwd,
+            args,
+            stdin_document,
+            reply,
+            term,
+            grid,
+            term_program,
+            None,
+        )
+    }
+
+    fn spawn_with_program_hints(
+        cwd: Option<&std::path::Path>,
+        args: &[&str],
+        stdin_document: Option<&[u8]>,
+        reply: ProbeReply,
+        term: &str,
         (cols, rows, cell_w, cell_h): (u16, u16, u16, u16),
+        term_program: Option<&str>,
+        term_program_version: Option<&str>,
     ) -> Self {
         let pty = Pty::open(cols, rows);
 
@@ -560,6 +654,22 @@ impl PtyRun {
         let mut command = Command::new(BIN);
         command.args(args);
         command.env("TERM", term);
+        match term_program {
+            Some(term_program) => {
+                command.env("TERM_PROGRAM", term_program);
+            }
+            None => {
+                command.env_remove("TERM_PROGRAM");
+            }
+        }
+        match term_program_version {
+            Some(version) => {
+                command.env("TERM_PROGRAM_VERSION", version);
+            }
+            None => {
+                command.env_remove("TERM_PROGRAM_VERSION");
+            }
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -835,6 +945,187 @@ fn live_pager_no_watch_holds_the_original_revision() {
 
     run.keys(b"q");
     assert!(run.wait_exit(timeout).success());
+    assert!(run.stderr().is_empty());
+}
+
+fn direct_ghostty_without_program_hints(reply: ProbeReply) -> PtyRun {
+    PtyRun::spawn_with_hints(
+        None,
+        &[FIXTURE, "--no-watch", "--scripted-actions"],
+        None,
+        reply,
+        "xterm-ghostty",
+        DEFAULT_GRID,
+        None,
+    )
+}
+
+fn assert_direct_frame_edits(run: &mut PtyRun, expected: bool) {
+    let timeout = Duration::from_secs(10);
+    if expected {
+        assert!(
+            run.wait_for(b"\x1b_Ga=f,f=100", timeout),
+            "steady frames used a full upload: {}",
+            describe_capture(&run.capture)
+        );
+    }
+    assert!(
+        run.wait_exit(timeout).success(),
+        "run failed: {}",
+        describe_capture(&run.capture)
+    );
+    let full = run.capture.count(b"\x1b_Ga=T,f=100");
+    let edits = run.capture.count(b"\x1b_Ga=f,f=100");
+    if expected {
+        assert_eq!(
+            full,
+            1,
+            "only the first frame should bootstrap: {}",
+            describe_capture(&run.capture)
+        );
+        assert!(edits >= 1, "steady frames edit the base frame");
+    } else {
+        assert_eq!(
+            edits,
+            0,
+            "unproven terminals must keep full frames: {}",
+            describe_capture(&run.capture)
+        );
+        assert!(
+            full >= 2,
+            "every frame should be a full upload: {}",
+            describe_capture(&run.capture)
+        );
+    }
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn direct_ghostty_probe_accepts_14_identity_without_program_hints() {
+    // A missing TERM_PROGRAM/TERM_PROGRAM_VERSION is not accepted on the
+    // terminfo name alone; the probe must prove Ghostty 1.4+ via XTVERSION.
+    let mut run =
+        direct_ghostty_without_program_hints(ProbeReply::GraphicsWithIdentity("ghostty 1.4.0"));
+    assert!(run.wait_for(b"\x1b[>0q", Duration::from_secs(8)));
+    assert_direct_frame_edits(&mut run, true);
+}
+
+#[test]
+fn direct_ghostty_env_version_keeps_frame_edits_without_an_identity_query() {
+    let mut run = PtyRun::spawn_with_program_hints(
+        None,
+        &[FIXTURE, "--no-watch", "--scripted-actions"],
+        None,
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+        DEFAULT_GRID,
+        Some("ghostty"),
+        Some("1.4.0"),
+    );
+    assert_direct_frame_edits(&mut run, true);
+    assert_eq!(
+        run.capture.count(b"\x1b[>0q"),
+        0,
+        "known normal env must not pay the XTVERSION round trip"
+    );
+}
+
+#[test]
+fn direct_ghostty_explicit_old_env_version_never_probes_or_edits() {
+    let mut run = PtyRun::spawn_with_program_hints(
+        None,
+        &[FIXTURE, "--no-watch", "--scripted-actions"],
+        None,
+        ProbeReply::GraphicsWithIdentity("ghostty 1.4.0"),
+        "xterm-ghostty",
+        DEFAULT_GRID,
+        Some("ghostty"),
+        Some("1.3.9"),
+    );
+    assert_direct_frame_edits(&mut run, false);
+    assert_eq!(
+        run.capture.count(b"\x1b[>0q"),
+        0,
+        "an explicit old version is authoritative; do not ask"
+    );
+}
+
+#[test]
+fn direct_ghostty_probe_handles_split_identity_reply() {
+    let mut run = direct_ghostty_without_program_hints(ProbeReply::GraphicsWithSplitIdentity(
+        "ghostty 1.4.0",
+    ));
+    assert_direct_frame_edits(&mut run, true);
+}
+
+#[test]
+fn direct_ghostty_probe_rejects_old_or_foreign_identity() {
+    for reply in [
+        ProbeReply::GraphicsWithIdentity("ghostty 1.3.9"),
+        ProbeReply::GraphicsWithIdentity("kitty(0.40.0)"),
+        ProbeReply::GraphicsWithIdentity("WezTerm 20240203"),
+    ] {
+        let mut run = direct_ghostty_without_program_hints(reply);
+        assert!(run.wait_for(b"\x1b[>0q", Duration::from_secs(8)));
+        assert_direct_frame_edits(&mut run, false);
+    }
+}
+
+#[test]
+fn direct_ghostty_probe_without_reply_keeps_full_frames() {
+    // Timeout-tolerant: no XTVERSION answer means no frame edits, and the
+    // session still starts and exits within the normal startup budget.
+    let mut run = direct_ghostty_without_program_hints(ProbeReply::GraphicsOk);
+    assert!(run.wait_for(b"\x1b[>0q", Duration::from_secs(8)));
+    assert_direct_frame_edits(&mut run, false);
+}
+
+#[test]
+fn default_launch_selects_probe_gated_frame_edits_without_flags() {
+    // Ordinary launch (`glisk <file>`, no capability flags, no scripted
+    // actions) with both Ghostty program hints absent. The emulated terminal
+    // answers the XTVERSION query, and a normal scroll key must redraw through
+    // the in-place frame-edit path before the operator quits.
+    let mut run = PtyRun::spawn_with_hints(
+        None,
+        &[FIXTURE],
+        None,
+        ProbeReply::GraphicsWithIdentity("ghostty 1.4.0"),
+        "xterm-ghostty",
+        DEFAULT_GRID,
+        None,
+    );
+    assert!(
+        run.wait_for(b"\x1b[>0q", Duration::from_secs(8)),
+        "the missing hints must trigger the identity query"
+    );
+    assert!(
+        run.wait_for(b"\x1b_Ga=T,f=100", Duration::from_secs(10)),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert_eq!(
+        run.capture.count(b"\x1b_Ga=f,f=100"),
+        0,
+        "the first frame bootstraps and idle draws do not edit"
+    );
+
+    let mark = run.capture.len();
+    run.keys(b"j");
+    assert!(
+        run.capture
+            .wait_for_after(mark, b"\x1b_Ga=f,f=100", Duration::from_secs(10)),
+        "normal scroll did not use a frame edit: {}",
+        describe_capture(&run.capture)
+    );
+    assert_eq!(
+        run.capture.count(b"\x1b_Ga=T,f=100"),
+        1,
+        "only the bootstrap frame is a full upload"
+    );
+
+    run.keys(b"q");
+    assert!(run.wait_exit(Duration::from_secs(5)).success());
     assert!(run.stderr().is_empty());
 }
 

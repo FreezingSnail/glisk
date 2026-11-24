@@ -34,12 +34,16 @@ rather than a screen-buffer read.
 
 ## Method and honesty note
 
-The pager ran in separate direct Ghostty 1.4 processes with `TERM_PROGRAM` and
-`TMUX` unset, so it took the verified direct Kitty path. The report frames are
+The pager ran in separate direct Ghostty 1.4 processes inside the verified
+direct Kitty path. `TMUX` and `TMUX_PANE` were unset so the new window did not
+inherit the launching tmux server. `TERM_PROGRAM` and `TERM_PROGRAM_VERSION`
+were left intact: they select the non-blanking `a=f` frame-editing path without
+a probe. A launcher that strips them still reaches the same path when the
+direct XTVERSION probe answered `ghostty` 1.4 or newer. The report frames are
 unmodified PNGs written by the live pager:
 
 ```sh
-unset TMUX TMUX_PANE TERM_PROGRAM
+unset TMUX TMUX_PANE
 ./target/release/glisk examples/tour/index.html --no-watch \
   --dump-dir=/path/to/tour-frames --metrics=/path/to/tour.metrics
 ```

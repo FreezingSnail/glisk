@@ -30,7 +30,9 @@
 //! ordinary pane output.
 
 use std::{
-    env, fmt,
+    env,
+    ffi::OsString,
+    fmt,
     fs::{File, OpenOptions},
     io,
     os::fd::{AsRawFd, RawFd},
@@ -225,6 +227,18 @@ pub enum GraphicsHint {
     Unknown,
 }
 
+/// What the process environment proves about Ghostty frame editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameEditingEvidence {
+    /// Positive `TERM_PROGRAM=ghostty` + `TERM_PROGRAM_VERSION>=1.4` evidence.
+    Supported,
+    /// Explicitly old, unusable, or non-Ghostty identity.
+    Unsupported,
+    /// Ghostty-shaped hints without positive version evidence; XTVERSION can
+    /// supply it.
+    NeedsProbe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentHint {
     pub term_program: Option<String>,
@@ -239,18 +253,19 @@ impl EnvironmentHint {
     /// supply geometry; the only feature decision is the explicit Ghostty
     /// frame-editing gate in [`Self::frame_editing_supported`].
     pub fn detect() -> Self {
-        let term_program = env::var("TERM_PROGRAM").ok();
-        let term_program_version = env::var("TERM_PROGRAM_VERSION").ok();
-        let term = env::var("TERM").ok();
-        let kitty_window = env::var_os("KITTY_WINDOW_ID").is_some();
-        let graphics = match (term_program.as_deref(), term.as_deref()) {
-            (Some(p), _) if p.eq_ignore_ascii_case("ghostty") => GraphicsHint::Ghostty,
-            (Some(p), _) if p.eq_ignore_ascii_case("wezterm") => GraphicsHint::WezTerm,
-            (_, Some(t)) if t.contains("kitty") || kitty_window => GraphicsHint::Kitty,
-            (Some(p), _) if !p.is_empty() => GraphicsHint::Other(p.to_string()),
-            (_, Some(t)) if !t.is_empty() => GraphicsHint::Other(t.to_string()),
-            _ => GraphicsHint::Unknown,
-        };
+        Self::detect_from(|key| env::var_os(key))
+    }
+
+    /// Testable form of [`Self::detect`]: `lookup` returns an environment
+    /// variable value by name. `KITTY_WINDOW_ID` is tested for presence
+    /// before decoding, so a non-UTF8 value still selects the Kitty path.
+    fn detect_from(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Self {
+        let term_program = lookup("TERM_PROGRAM").and_then(|value| value.into_string().ok());
+        let term_program_version =
+            lookup("TERM_PROGRAM_VERSION").and_then(|value| value.into_string().ok());
+        let term = lookup("TERM").and_then(|value| value.into_string().ok());
+        let kitty_window = lookup("KITTY_WINDOW_ID").is_some();
+        let graphics = classify_graphics(term_program.as_deref(), term.as_deref(), kitty_window);
         Self {
             term_program,
             term_program_version,
@@ -260,21 +275,91 @@ impl EnvironmentHint {
         }
     }
 
-    /// True only for a verified Ghostty 1.4+ direct terminal.
+    /// Capability evidence without asking the terminal.
     ///
     /// A successful basic Kitty query proves drawing support, not animation
     /// frame editing. Ghostty 1.4.0 implements `a=f` frame overwrite but
-    /// predates Kitty's feature query, so the direct path deliberately gates on
-    /// Ghostty's own `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` contract instead of
-    /// assuming the action from the basic query.
-    pub fn frame_editing_supported(&self) -> bool {
-        matches!(self.graphics, GraphicsHint::Ghostty)
-            && self
-                .term_program_version
-                .as_deref()
-                .and_then(parse_program_version)
-                .is_some_and(|version| version >= MIN_FRAME_EDITING_GHOSTTY)
+    /// predates Kitty's feature query, so the direct path gates on Ghostty's
+    /// own identity instead of assuming the action from the basic query.
+    ///
+    /// `TERM_PROGRAM=ghostty` plus a parsed `TERM_PROGRAM_VERSION>=1.4` is
+    /// positive evidence on its own. An explicit older or unparseable version
+    /// keeps the non-destructive full-frame path. Everything else that still
+    /// looks like Ghostty (a stripped program name, a missing version, or a
+    /// lone compatible version without a program name) is
+    /// [`FrameEditingEvidence::NeedsProbe`]: the owner asks XTVERSION and only
+    /// a `ghostty >=1.4` reply enables edits.
+    pub fn frame_editing_evidence(&self) -> FrameEditingEvidence {
+        if !matches!(self.graphics, GraphicsHint::Ghostty) {
+            return FrameEditingEvidence::Unsupported;
+        }
+        let program_is_ghostty = self
+            .term_program
+            .as_deref()
+            .is_some_and(|program| program.eq_ignore_ascii_case("ghostty"));
+        match self
+            .term_program_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+        {
+            Some(version) => match parse_program_version(version) {
+                Some(version) if version >= MIN_FRAME_EDITING_GHOSTTY => {
+                    if program_is_ghostty {
+                        FrameEditingEvidence::Supported
+                    } else {
+                        // A compatible version without a Ghostty program name
+                        // is not positive identity; ask the terminal.
+                        FrameEditingEvidence::NeedsProbe
+                    }
+                }
+                // An explicit pre-1.4 (or unusable) version is authoritative
+                // and never enables edits through the probe fallback.
+                Some(_) | None => FrameEditingEvidence::Unsupported,
+            },
+            None => FrameEditingEvidence::NeedsProbe,
+        }
     }
+
+    /// Environment-only gate. The terminal owner additionally accepts a
+    /// proven XTVERSION reply when this returns
+    /// [`FrameEditingEvidence::NeedsProbe`].
+    pub fn frame_editing_supported(&self) -> bool {
+        self.frame_editing_evidence() == FrameEditingEvidence::Supported
+    }
+}
+
+fn classify_graphics(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    kitty_window: bool,
+) -> GraphicsHint {
+    if let Some(program) = term_program.filter(|program| !program.is_empty()) {
+        if program.eq_ignore_ascii_case("ghostty") {
+            return GraphicsHint::Ghostty;
+        }
+        if program.eq_ignore_ascii_case("wezterm") {
+            return GraphicsHint::WezTerm;
+        }
+    }
+    // Some launchers strip TERM_PROGRAM but leave Ghostty's own terminfo
+    // name. Only use it when no other program identity is present.
+    if term_program.is_none_or(|program| program.trim().is_empty())
+        && !kitty_window
+        && term.is_some_and(|term| term.eq_ignore_ascii_case("xterm-ghostty"))
+    {
+        return GraphicsHint::Ghostty;
+    }
+    if term.is_some_and(|term| term.contains("kitty")) || kitty_window {
+        return GraphicsHint::Kitty;
+    }
+    if let Some(program) = term_program.filter(|program| !program.is_empty()) {
+        return GraphicsHint::Other(program.to_string());
+    }
+    if let Some(term) = term.filter(|term| !term.is_empty()) {
+        return GraphicsHint::Other(term.to_string());
+    }
+    GraphicsHint::Unknown
 }
 
 /// First Ghostty version with the verified `a=f` existing-frame overwrite path.
@@ -291,6 +376,59 @@ fn parse_program_version(value: &str) -> Option<(u32, u32)> {
         .parse::<u32>()
         .ok()?;
     Some((major, minor))
+}
+
+/// A decoded XTVERSION (DCS `>|`) reply. Ghostty 1.4.0 answers
+/// `CSI > 0 q` with `ESC P > | ghostty <version> ESC \` (no spaces around the
+/// delimiters).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalIdentity {
+    pub name: String,
+    pub version_text: String,
+    pub version: Option<(u32, u32)>,
+}
+
+impl TerminalIdentity {
+    /// Positive evidence for the verified `a=f` path: a Ghostty identity at
+    /// 1.4 or newer. Any other name, version, or malformed value is a no.
+    pub fn supports_frame_editing(&self) -> bool {
+        self.name.eq_ignore_ascii_case("ghostty")
+            && self
+                .version
+                .is_some_and(|version| version >= MIN_FRAME_EDITING_GHOSTTY)
+    }
+
+    pub fn describe(&self) -> String {
+        if self.version_text.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} {}", self.name, self.version_text)
+        }
+    }
+}
+
+/// Parse the body of a DCS `>|` reply (without the DCS prefix or terminator).
+/// Ghostty uses `name version`; some terminals use `name(version)`.
+fn parse_xtversion(body: &[u8]) -> Option<TerminalIdentity> {
+    let body = body.strip_prefix(b">|")?;
+    let text = std::str::from_utf8(body).ok()?.trim();
+    let split = text.find([' ', '(']);
+    let (name, rest) = match split {
+        Some(index) => (&text[..index], &text[index..]),
+        None => (text, ""),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let version_text = rest
+        .trim_start_matches([' ', '('])
+        .trim_end_matches(')')
+        .trim();
+    Some(TerminalIdentity {
+        name: name.to_string(),
+        version_text: version_text.to_string(),
+        version: parse_program_version(version_text),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +606,10 @@ pub struct TerminalConfig {
     /// Override the terminal's frame-editing capability. `None` uses the
     /// verified Ghostty gate for direct terminals and tmux detection for panes.
     pub frame_editing: Option<bool>,
+    /// Test-only environment override so PTY tests do not depend on the
+    /// developer's shell.
+    #[cfg(test)]
+    pub environment: Option<EnvironmentHint>,
 }
 
 impl Default for TerminalConfig {
@@ -481,6 +623,8 @@ impl Default for TerminalConfig {
             max_encoded_bytes: MAX_ENCODED_BYTES,
             max_raster_pixels: MAX_RASTER_PIXELS,
             frame_editing: None,
+            #[cfg(test)]
+            environment: None,
         }
     }
 }
@@ -538,6 +682,12 @@ impl TerminalConfig {
     #[cfg(test)]
     pub fn with_frame_editing(mut self, supported: bool) -> Self {
         self.frame_editing = Some(supported);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_environment(mut self, environment: EnvironmentHint) -> Self {
+        self.environment = Some(environment);
         self
     }
 }
@@ -762,6 +912,9 @@ struct Scan {
     unexpected: Option<String>,
     incomplete: bool,
     saw_protocol: bool,
+    /// A DCS `>|` XTVERSION reply was consumed (parsed or not).
+    saw_xtversion: bool,
+    xtversion: Option<TerminalIdentity>,
 }
 
 /// Scan a complete prefix of `bytes`. The returned count is the consumed
@@ -834,13 +987,26 @@ fn scan_bytes(bytes: &[u8]) -> (usize, Scan) {
             }
             b']' | b'P' => {
                 // OSC or DCS. Preserve complete sequences as ordinary bytes;
-                // retain incomplete ones.
+                // retain incomplete ones. A DCS `>|` XTVERSION reply is a
+                // protocol answer, so consume it instead of delivering it as
+                // keys.
                 let Some(rel_end) = find_string_terminator(&bytes[i + 2..]) else {
                     scan.incomplete = true;
                     break;
                 };
                 let consumed = i + 2 + rel_end;
-                scan.keys.extend_from_slice(&bytes[i..consumed]);
+                let body = &bytes[i + 2..consumed];
+                let body = body
+                    .strip_suffix(b"\x1b\\")
+                    .or_else(|| body.strip_suffix(b"\x07"))
+                    .unwrap_or(body);
+                if bytes[i + 1] == b'P' && body.starts_with(b">|") {
+                    scan.saw_protocol = true;
+                    scan.saw_xtversion = true;
+                    scan.xtversion = parse_xtversion(body);
+                } else {
+                    scan.keys.extend_from_slice(&bytes[i..consumed]);
+                }
                 i = consumed;
             }
             b'O' => {
@@ -945,10 +1111,12 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
 // Probe
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeReport {
     pub cell: CellPixels,
     pub elapsed: Duration,
+    /// Decoded `CSI > 0 q` reply, present only when the probe asked for it.
+    pub xtversion: Option<TerminalIdentity>,
 }
 
 fn probe_terminal(
@@ -956,13 +1124,18 @@ fn probe_terminal(
     output_fd: RawFd,
     budget: Duration,
     keys: &mut Vec<u8>,
+    tail: &mut Vec<u8>,
+    ask_xtversion: bool,
 ) -> Result<ProbeReport, ProbeError> {
     let started = Instant::now();
     let deadline = started + budget;
     // `CSI 16 t` asks for the cell size; the Kitty query confirms graphics
-    // support without creating an image. Send both, then read one shared
-    // budget.
-    let queries = format!("\x1b[16t\x1b_Gi={PROBE_IMAGE_ID},a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\");
+    // support without creating an image. When the environment cannot prove
+    // Ghostty 1.4+, `CSI > 0 q` asks for XTVERSION in the same shared budget.
+    let mut queries = format!("\x1b[16t\x1b_Gi={PROBE_IMAGE_ID},a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\");
+    if ask_xtversion {
+        queries.push_str("\x1b[>0q");
+    }
     if let Err(err) = write_fd(output_fd, queries.as_bytes()) {
         return Err(ProbeError {
             kind: ProbeFailureKind::UnsupportedGraphics,
@@ -974,6 +1147,8 @@ fn probe_terminal(
     let mut buffer: Vec<u8> = Vec::new();
     let mut graphics: Option<KittyReply> = None;
     let mut cell: Option<CellDims> = None;
+    let mut xtversion: Option<TerminalIdentity> = None;
+    let mut identity_answered = !ask_xtversion;
     let mut unexpected: Option<String> = None;
     let mut saw_reply = false;
     #[allow(unused_assignments)]
@@ -1000,6 +1175,12 @@ fn probe_terminal(
             }
             graphics = Some(reply);
         }
+        if scan.saw_xtversion {
+            identity_answered = true;
+            if scan.xtversion.is_some() {
+                xtversion = scan.xtversion;
+            }
+        }
         if let Some(detail) = scan.unexpected {
             unexpected = Some(detail);
         }
@@ -1011,10 +1192,16 @@ fn probe_terminal(
                 elapsed: started.elapsed(),
             });
         }
-        if graphics.is_some() && cell.and_then(CellDims::cell).is_some() {
+        if graphics.is_some() && cell.and_then(CellDims::cell).is_some() && identity_answered {
+            // A reply that began in this read may still be incomplete (for
+            // example a partial XTVERSION after the cell and Kitty answers).
+            // Hand the unconsumed tail to the live parser instead of dropping
+            // it, or its suffix would arrive as ordinary keys.
+            *tail = buffer;
             return Ok(ProbeReport {
                 cell: cell.and_then(CellDims::cell).expect("checked"),
                 elapsed: started.elapsed(),
+                xtversion,
             });
         }
 
@@ -1049,12 +1236,13 @@ fn probe_terminal(
     }
 
     // A lone Escape at the deadline is a retained ordinary key, not a partial
-    // protocol reply.
+    // protocol reply. It is already in `keys`; do not also carry it.
     if buffer.len() >= 2 && buffer[0] == 0x1b {
         incomplete = true;
     }
     if buffer == [0x1b] {
         keys.push(0x1b);
+        buffer.clear();
     }
 
     let elapsed = started.elapsed();
@@ -1076,7 +1264,14 @@ fn probe_terminal(
 
     match (graphics, cell) {
         (Some(KittyReply::Ok), Some(dims)) => match dims.cell() {
-            Some(cell) => Ok(ProbeReport { cell, elapsed }),
+            Some(cell) => {
+                *tail = buffer;
+                Ok(ProbeReport {
+                    cell,
+                    elapsed,
+                    xtversion,
+                })
+            }
             None => Err(ProbeError {
                 kind: ProbeFailureKind::MissingGeometry,
                 detail: format!("invalid cell size {}x{}", dims.width, dims.height),
@@ -1145,6 +1340,9 @@ pub struct FrameStats {
     pub encoded_bytes: usize,
     pub chunks: usize,
     pub wire_bytes: usize,
+    /// True when the frame re-established the image/placement with `a=T`
+    /// instead of editing an existing frame.
+    pub full_frame: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,15 +1472,37 @@ impl TerminalOwner {
             read_termios(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
         set_raw(input_fd).map_err(|err| TerminalError::RawMode(err.to_string()))?;
 
+        #[cfg(test)]
+        let environment = config
+            .environment
+            .clone()
+            .unwrap_or_else(EnvironmentHint::detect);
+        #[cfg(not(test))]
+        let environment = EnvironmentHint::detect();
+        // Only ask the terminal when the environment cannot prove frame
+        // editing on its own and the caller did not override the decision.
+        let ask_xtversion = config.frame_editing.is_none()
+            && environment.frame_editing_evidence() == FrameEditingEvidence::NeedsProbe;
+
         let mut pending_keys = Vec::new();
-        let probe =
-            match probe_terminal(input_fd, output_fd, config.probe_budget, &mut pending_keys) {
-                Ok(report) => report,
-                Err(err) => {
-                    let _ = restore_termios(input_fd, &saved);
-                    return Err(TerminalError::Probe(err));
-                }
-            };
+        // An incomplete reply tail read during the probe (for example a
+        // partial XTVERSION that finishes after startup) is seeded into the
+        // live parser rather than delivered as ordinary keys.
+        let mut pending_input = Vec::new();
+        let probe = match probe_terminal(
+            input_fd,
+            output_fd,
+            config.probe_budget,
+            &mut pending_keys,
+            &mut pending_input,
+            ask_xtversion,
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                let _ = restore_termios(input_fd, &saved);
+                return Err(TerminalError::Probe(err));
+            }
+        };
 
         let (cols, rows) = match terminal_size(output_fd) {
             Ok(size) => size,
@@ -1311,10 +1531,17 @@ impl TerminalOwner {
         }
 
         let image_id = config.image_id;
-        let environment = EnvironmentHint::detect();
-        let frame_editing = config
-            .frame_editing
-            .unwrap_or_else(|| environment.frame_editing_supported());
+        let frame_editing =
+            config
+                .frame_editing
+                .unwrap_or_else(|| match environment.frame_editing_evidence() {
+                    FrameEditingEvidence::Supported => true,
+                    FrameEditingEvidence::Unsupported => false,
+                    FrameEditingEvidence::NeedsProbe => probe
+                        .xtversion
+                        .as_ref()
+                        .is_some_and(TerminalIdentity::supports_frame_editing),
+                });
         Ok(Self {
             input_fd,
             output_fd,
@@ -1328,7 +1555,7 @@ impl TerminalOwner {
             probe,
             placement: Placement::Direct,
             keys_pending: pending_keys,
-            input_buffer: Vec::new(),
+            input_buffer: pending_input,
             image_owned: false,
             finished: false,
             tmux_last_sync: Instant::now(),
@@ -1406,6 +1633,7 @@ impl TerminalOwner {
             probe: ProbeReport {
                 cell,
                 elapsed: Duration::ZERO,
+                xtversion: None,
             },
             placement: Placement::Tmux(pane),
             image_id: tmux::session_image_id(),
@@ -1472,7 +1700,12 @@ impl TerminalOwner {
     }
 
     pub fn probe_report(&self) -> ProbeReport {
-        self.probe
+        self.probe.clone()
+    }
+
+    /// Decoded XTVERSION identity, when the direct probe asked for one.
+    pub fn terminal_identity(&self) -> Option<&TerminalIdentity> {
+        self.probe.xtversion.as_ref()
     }
 
     /// Read the current grid size via `TIOCGWINSZ` and recompute geometry when
@@ -1762,11 +1995,8 @@ impl TerminalOwner {
                         }
                     } else if index == 0 {
                         wire.extend_from_slice(
-                            format!(
-                                "\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};",
-                                self.image_id
-                            )
-                            .as_bytes(),
+                            format!("\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};", self.image_id)
+                                .as_bytes(),
                         );
                     } else {
                         wire.extend_from_slice(format!("\x1b_Ga=f,m={more};").as_bytes());
@@ -1803,11 +2033,8 @@ impl TerminalOwner {
                         }
                     } else if index == 0 {
                         inner.extend_from_slice(
-                            format!(
-                                "\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};",
-                                self.image_id
-                            )
-                            .as_bytes(),
+                            format!("\x1b_Ga=f,f=100,i={},r=1,X=1,q=2,m={more};", self.image_id)
+                                .as_bytes(),
                         );
                     } else {
                         inner.extend_from_slice(format!("\x1b_Ga=f,m={more};").as_bytes());
@@ -1867,6 +2094,7 @@ impl TerminalOwner {
             encoded_bytes: encoded.len(),
             chunks: chunks.len(),
             wire_bytes: wire.len() + grid_bytes,
+            full_frame,
         })
     }
 
@@ -2056,6 +2284,8 @@ fn sanitize_status(text: &str, cols: u16) -> String {
 
 #[cfg(test)]
 mod parser_tests {
+    use std::os::unix::ffi::OsStringExt;
+
     use super::*;
 
     #[test]
@@ -2084,6 +2314,75 @@ mod parser_tests {
     }
 
     #[test]
+    fn scanner_consumes_xtversion_without_losing_keys() {
+        let bytes = b"\x1bP>|ghostty 1.4.0\x1b\\j";
+        let (consumed, scan) = scan_bytes(bytes);
+        assert_eq!(consumed, bytes.len());
+        assert!(scan.saw_xtversion);
+        assert_eq!(scan.keys, b"j");
+        let identity = scan.xtversion.expect("identity");
+        assert_eq!(identity.name, "ghostty");
+        assert_eq!(identity.version_text, "1.4.0");
+        assert_eq!(identity.version, Some((1, 4)));
+        assert!(identity.supports_frame_editing());
+    }
+
+    #[test]
+    fn scanner_rejects_foreign_and_malformed_identity() {
+        let foreign = scan_bytes(b"\x1bP>|kitty(0.40.0)\x1b\\").1;
+        assert!(foreign.saw_xtversion);
+        let foreign = foreign.xtversion.expect("parsed");
+        assert_eq!(foreign.name, "kitty");
+        assert!(!foreign.supports_frame_editing());
+
+        let malformed = scan_bytes(b"\x1bP>|\xff\xfe\x1b\\").1;
+        assert!(malformed.saw_xtversion);
+        assert_eq!(malformed.xtversion, None);
+        assert!(malformed.keys.is_empty());
+
+        // Non-XTVERSION DCS stays ordinary input.
+        let other = scan_bytes(b"\x1bPq#0;2;0;0;0\x1b\\").1;
+        assert!(!other.saw_xtversion);
+        assert_eq!(other.keys, b"\x1bPq#0;2;0;0;0\x1b\\");
+    }
+
+    #[test]
+    fn scanner_retains_split_xtversion_until_complete() {
+        let (consumed, scan) = scan_bytes(b"\x1bP>|ghostty 1.");
+        assert_eq!(consumed, 0);
+        assert!(scan.incomplete);
+        assert!(scan.keys.is_empty());
+
+        let (consumed, scan) = scan_bytes(b"\x1bP>|ghostty 1.4.0\x1b\\j");
+        assert_eq!(consumed, 20);
+        assert!(scan.saw_xtversion);
+        assert_eq!(scan.keys, b"j");
+        assert!(scan.xtversion.expect("identity").supports_frame_editing());
+    }
+
+    #[test]
+    fn xtversion_parser_handles_supported_shapes() {
+        let ghostty = parse_xtversion(b">|ghostty 1.4.0").expect("ghostty");
+        assert_eq!(ghostty.version, Some((1, 4)));
+        assert!(ghostty.supports_frame_editing());
+
+        let old = parse_xtversion(b">|ghostty 1.3.9").expect("old");
+        assert!(!old.supports_frame_editing());
+
+        let paren = parse_xtversion(b">|kitty(0.40.0)").expect("paren");
+        assert_eq!(paren.name, "kitty");
+        assert_eq!(paren.version, Some((0, 40)));
+
+        // Names alone are parseable but never prove frame editing.
+        let name_only = parse_xtversion(b">|ghostty").expect("name only");
+        assert_eq!(name_only.version, None);
+        assert!(!name_only.supports_frame_editing());
+
+        assert_eq!(parse_xtversion(b">|"), None);
+        assert_eq!(parse_xtversion(b"ghostty 1.4.0"), None);
+    }
+
+    #[test]
     fn status_is_sanitized_and_truncated() {
         assert_eq!(sanitize_status("hi\x1b[31mthere\n", 8), "hithere");
         assert_eq!(sanitize_status("abcdef", 4), "abc…");
@@ -2091,24 +2390,138 @@ mod parser_tests {
 
     #[test]
     fn frame_editing_gate_requires_verified_ghostty() {
-        let hint = |program: &str, version: Option<&str>| EnvironmentHint {
-            term_program: Some(program.to_string()),
-            term_program_version: version.map(str::to_string),
-            term: None,
-            kitty_window: false,
-            graphics: if program.eq_ignore_ascii_case("ghostty") {
-                GraphicsHint::Ghostty
-            } else {
-                GraphicsHint::Kitty
-            },
+        let hint =
+            |program: Option<&str>, version: Option<&str>, term: Option<&str>| EnvironmentHint {
+                term_program: program.map(str::to_string),
+                term_program_version: version.map(str::to_string),
+                term: term.map(str::to_string),
+                kitty_window: false,
+                graphics: classify_graphics(program, term, false),
+            };
+        let program = |program: &str, version: Option<&str>| hint(Some(program), version, None);
+        assert!(program("ghostty", Some("1.4.0")).frame_editing_supported());
+        assert!(program("ghostty", Some("1.4.0-2.fc42")).frame_editing_supported());
+        assert!(program("ghostty", Some("2.0")).frame_editing_supported());
+        assert!(!program("ghostty", Some("1.3.9")).frame_editing_supported());
+        assert!(!program("kitty", Some("0.51.0")).frame_editing_supported());
+        assert!(!program("WezTerm", Some("20240203")).frame_editing_supported());
+        assert_eq!(
+            program("ghostty", None).frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+
+        // A launcher may strip both Ghostty program hints while leaving the
+        // terminfo name. That is only a reason to ask the terminal; it is not
+        // positive version evidence on its own.
+        assert_eq!(
+            hint(None, None, Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+        assert_eq!(
+            hint(Some("ghostty"), None, Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+        assert_eq!(
+            hint(Some(""), None, Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+        // A compatible version without a Ghostty program name is not positive
+        // identity; the probe has to resolve it.
+        assert_eq!(
+            hint(None, Some("1.4.0"), Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+        // An explicit old version is authoritative over the terminfo name.
+        assert_eq!(
+            hint(Some("ghostty"), Some("1.3.9"), Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::Unsupported
+        );
+        assert_eq!(
+            hint(None, Some("1.3.9"), Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::Unsupported
+        );
+        // A malformed explicit version never enables the fallback.
+        assert_eq!(
+            hint(Some("ghostty"), Some("preview"), Some("xterm-ghostty")).frame_editing_evidence(),
+            FrameEditingEvidence::Unsupported
+        );
+        // A conflicting program identity is never overridden by TERM.
+        assert!(!hint(Some("tmux"), None, Some("xterm-ghostty")).frame_editing_supported());
+        assert!(!hint(None, None, Some("xterm-256color")).frame_editing_supported());
+
+        let identity = TerminalIdentity {
+            name: "ghostty".to_string(),
+            version_text: "1.4.0".to_string(),
+            version: Some((1, 4)),
         };
-        assert!(hint("ghostty", Some("1.4.0")).frame_editing_supported());
-        assert!(hint("ghostty", Some("1.4.0-2.fc42")).frame_editing_supported());
-        assert!(hint("ghostty", Some("2.0")).frame_editing_supported());
-        assert!(!hint("ghostty", Some("1.3.9")).frame_editing_supported());
-        assert!(!hint("ghostty", None).frame_editing_supported());
-        assert!(!hint("kitty", Some("0.51.0")).frame_editing_supported());
-        assert!(!hint("WezTerm", Some("20240203")).frame_editing_supported());
+        assert!(identity.supports_frame_editing());
+        let old = TerminalIdentity {
+            name: "ghostty".to_string(),
+            version_text: "1.3.9".to_string(),
+            version: Some((1, 3)),
+        };
+        assert!(!old.supports_frame_editing());
+        let other = TerminalIdentity {
+            name: "kitty".to_string(),
+            version_text: "0.40.0".to_string(),
+            version: Some((0, 40)),
+        };
+        assert!(!other.supports_frame_editing());
+    }
+
+    #[test]
+    fn environment_detection_uses_ghostty_terminfo_probe_trigger() {
+        let env = |pairs: &[(&str, OsString)]| {
+            let pairs: Vec<(String, OsString)> = pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect();
+            EnvironmentHint::detect_from(|key| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            })
+        };
+        let text = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(&str, OsString)> = pairs
+                .iter()
+                .map(|(key, value)| (*key, OsString::from(value)))
+                .collect();
+            env(&owned)
+        };
+
+        let direct = text(&[("TERM", "xterm-ghostty")]);
+        assert_eq!(direct.graphics, GraphicsHint::Ghostty);
+        assert_eq!(
+            direct.frame_editing_evidence(),
+            FrameEditingEvidence::NeedsProbe
+        );
+
+        let conflicted = text(&[
+            ("TERM", "xterm-ghostty"),
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM_VERSION", "3.5a"),
+        ]);
+        assert_eq!(conflicted.graphics, GraphicsHint::Other("tmux".into()));
+        assert!(!conflicted.frame_editing_supported());
+
+        let kitty_window = text(&[("TERM", "xterm-ghostty"), ("KITTY_WINDOW_ID", "1")]);
+        assert_eq!(kitty_window.graphics, GraphicsHint::Kitty);
+        assert!(!kitty_window.frame_editing_supported());
+
+        // Presence, not UTF8 validity, selects the Kitty path.
+        let non_utf8_kitty = env(&[("KITTY_WINDOW_ID", OsString::from_vec(vec![b'1', 0xff]))]);
+        assert!(non_utf8_kitty.kitty_window);
+        assert_eq!(non_utf8_kitty.graphics, GraphicsHint::Kitty);
+
+        let versioned = text(&[
+            ("TERM", "xterm-ghostty"),
+            ("TERM_PROGRAM", "ghostty"),
+            ("TERM_PROGRAM_VERSION", "1.4.0"),
+        ]);
+        assert_eq!(versioned.graphics, GraphicsHint::Ghostty);
+        assert!(versioned.frame_editing_supported());
     }
 
     #[test]

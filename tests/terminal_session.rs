@@ -23,8 +23,8 @@ use std::{
 };
 
 use terminal::{
-    CellPixels, FrameStats, Geometry, InputBatch, ProbeFailureKind, TerminalConfig, TerminalError,
-    TerminalOwner,
+    CellPixels, EnvironmentHint, FrameStats, Geometry, GraphicsHint, InputBatch, ProbeFailureKind,
+    TerminalConfig, TerminalError, TerminalOwner,
 };
 
 static PTY_LOCK: Mutex<()> = Mutex::new(());
@@ -182,7 +182,7 @@ fn present_captured(owner: &mut TerminalOwner, master: RawFd, png: &[u8]) -> (Fr
     (stats, wire)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ProbePlan {
     Success,
     Timeout,
@@ -190,6 +190,17 @@ enum ProbePlan {
     GraphicsError,
     MalformedCell,
     IncompleteCell,
+    /// Answers `CSI > 0 q` with a Ghostty 1.4.0 XTVERSION.
+    SuccessXtversion,
+    /// Explicit pre-1.4 Ghostty.
+    OldXtversion,
+    /// Another terminal answering the same query.
+    ForeignXtversion,
+    /// XTVERSION reply split across two writes with a key after it.
+    SplitXtversion,
+    /// Cell and Kitty replies plus an unterminated XTVERSION prefix; the
+    /// suffix is written after the owner is established.
+    PrefixXtversion,
 }
 
 fn spawn_reply(master: RawFd, reply: Vec<u8>) -> thread::JoinHandle<()> {
@@ -242,11 +253,52 @@ fn spawn_probe_service(master: RawFd, plan: ProbePlan) -> thread::JoinHandle<()>
                 reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
                 reply.extend_from_slice(b"\x1b[6;32;");
             }
+            ProbePlan::SuccessXtversion => {
+                reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+                reply.extend_from_slice(b"\x1b[6;32;16t");
+                reply.extend_from_slice(b"\x1bP>|ghostty 1.4.0\x1b\\");
+            }
+            ProbePlan::OldXtversion => {
+                reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+                reply.extend_from_slice(b"\x1b[6;32;16t");
+                reply.extend_from_slice(b"\x1bP>|ghostty 1.3.9\x1b\\");
+            }
+            ProbePlan::ForeignXtversion => {
+                reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+                reply.extend_from_slice(b"\x1b[6;32;16t");
+                reply.extend_from_slice(b"\x1bP>|kitty(0.40.0)\x1b\\");
+            }
+            ProbePlan::SplitXtversion => {
+                reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+                reply.extend_from_slice(b"\x1b[6;32;16t");
+                reply.extend_from_slice(b"\x1bP>|ghostty 1.");
+                write_master(master, &reply);
+                thread::sleep(Duration::from_millis(20));
+                write_master(master, b"4.0\x1b\\j");
+                return;
+            }
+            ProbePlan::PrefixXtversion => {
+                reply.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+                reply.extend_from_slice(b"\x1b[6;32;16t");
+                // The reply starts but never completes inside the startup
+                // budget. Its suffix is written after establishment.
+                reply.extend_from_slice(b"\x1bP>|gh");
+            }
         }
         if !reply.is_empty() {
             write_master(master, &reply);
         }
     })
+}
+
+fn ghostty_terminfo_env() -> EnvironmentHint {
+    EnvironmentHint {
+        term_program: None,
+        term_program_version: None,
+        term: Some("xterm-ghostty".to_string()),
+        kitty_window: false,
+        graphics: GraphicsHint::Ghostty,
+    }
 }
 
 fn get_termios(fd: RawFd) -> libc::termios {
@@ -540,6 +592,136 @@ fn frame_uses_one_image_chunks_and_preserves_cursor() {
 }
 
 #[test]
+fn direct_probe_accepts_only_positive_ghostty_14_xtversion() {
+    for (plan, expected) in [
+        (ProbePlan::SuccessXtversion, true),
+        (ProbePlan::OldXtversion, false),
+        (ProbePlan::ForeignXtversion, false),
+        (ProbePlan::Success, false),
+    ] {
+        let pty = Pty::open(80, 24);
+        let mut owner = open_with_plan(
+            &pty,
+            probe_config(400).with_environment(ghostty_terminfo_env()),
+            plan,
+        )
+        .expect("probe");
+        assert_eq!(
+            owner.frame_editing_supported(),
+            expected,
+            "capability for {plan:?}"
+        );
+
+        let first = fake_png_with_raster(1280, 736, 9000, 1);
+        let second = fake_png_with_raster(1280, 736, 9000, 2);
+        let (_, first_wire) = present_captured(&mut owner, pty.master, &first);
+        let (_, second_wire) = present_captured(&mut owner, pty.master, &second);
+        assert!(contains(&first_wire, b"a=T,f=100"));
+        assert_eq!(
+            contains(&second_wire, b"a=f"),
+            expected,
+            "steady wire for {plan:?}"
+        );
+        assert_eq!(contains(&second_wire, b"a=T"), !expected, "{plan:?}");
+        owner.finish().expect("finish");
+    }
+}
+
+#[test]
+fn split_xtversion_during_probe_is_consumed_and_key_is_retained() {
+    let pty = Pty::open(80, 24);
+    let mut owner = open_with_plan(
+        &pty,
+        probe_config(400).with_environment(ghostty_terminfo_env()),
+        ProbePlan::SplitXtversion,
+    )
+    .expect("probe");
+    assert!(owner.frame_editing_supported());
+    assert_eq!(
+        owner
+            .terminal_identity()
+            .map(|identity| identity.describe()),
+        Some("ghostty 1.4.0".to_string())
+    );
+    let batch = owner
+        .poll_input(Duration::from_millis(0))
+        .expect("poll")
+        .expect("probe-time key retained");
+    assert_eq!(batch.bytes, b"j");
+    owner.finish().expect("finish");
+}
+
+#[test]
+fn xtversion_prefix_during_probe_is_carried_into_live_input() {
+    let pty = Pty::open(80, 24);
+    let mut owner = open_with_plan(
+        &pty,
+        probe_config(400).with_environment(ghostty_terminfo_env()),
+        ProbePlan::PrefixXtversion,
+    )
+    .expect("valid cell and Kitty replies succeed the probe");
+    // The startup budget ended with a complete cell/Kitty answer and no
+    // identity, so the session keeps full frames.
+    assert!(!owner.frame_editing_supported());
+    // The incomplete DCS prefix was consumed by the probe, not delivered.
+    assert!(
+        owner
+            .poll_input(Duration::from_millis(0))
+            .expect("poll")
+            .is_none(),
+        "an incomplete protocol prefix is not a key"
+    );
+
+    // Complete the reply now that the owner exists, then append an ordinary
+    // key. Only the key may be delivered, and the late identity must not
+    // upgrade the already-negotiated frame path.
+    write_master(pty.master, b"ostty 1.4.0\x1b\\j");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut batch = InputBatch::default();
+    while Instant::now() < deadline && batch.bytes.is_empty() {
+        if let Some(next) = owner.poll_input(Duration::from_millis(50)).expect("poll") {
+            batch = next;
+        }
+    }
+    assert_eq!(batch.bytes, b"j");
+    assert!(!batch.interrupt);
+    assert!(
+        !owner.frame_editing_supported(),
+        "a reply finishing after startup must not upgrade the frame path"
+    );
+    owner.finish().expect("finish");
+}
+
+#[test]
+fn late_xtversion_reply_is_consumed_without_upgrading_or_losing_keys() {
+    let pty = Pty::open(80, 24);
+    let mut owner = open_with_plan(
+        &pty,
+        probe_config(200).with_environment(ghostty_terminfo_env()),
+        ProbePlan::Success,
+    )
+    .expect("probe");
+    assert!(!owner.frame_editing_supported());
+    let _ = drain(pty.master);
+
+    write_master(pty.master, b"\x1bP>|ghostty 1.4.0\x1b\\j");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut batch = InputBatch::default();
+    while Instant::now() < deadline && batch.bytes.is_empty() {
+        if let Some(next) = owner.poll_input(Duration::from_millis(50)).expect("poll") {
+            batch = next;
+        }
+    }
+    assert_eq!(batch.bytes, b"j");
+    assert!(!batch.interrupt);
+    assert!(
+        !owner.frame_editing_supported(),
+        "a late reply must not silently change the negotiated frame path"
+    );
+    owner.finish().expect("finish");
+}
+
+#[test]
 fn multiple_frames_replace_one_image_id() {
     let pty = Pty::open(50, 20);
     let mut owner = open_with_plan(
@@ -620,7 +802,10 @@ fn steady_frame_edits_overwrite_base_frame_without_replacing_placement() {
         &second_wire,
         format!("\x1b_Ga=f,f=100,i={image_id},r=1,X=1,q=2,m=1;").as_bytes()
     ));
-    assert_eq!(count(&second_wire, b"\x1b_Ga=f,m=1;"), second_stats.chunks - 2);
+    assert_eq!(
+        count(&second_wire, b"\x1b_Ga=f,m=1;"),
+        second_stats.chunks - 2
+    );
     assert_eq!(count(&second_wire, b"\x1b_Ga=f,m=0;"), 1);
 
     let payload: Vec<u8> = kitty_payloads(&second_wire)

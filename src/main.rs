@@ -377,6 +377,11 @@ impl Pager {
                 let stats = owner
                     .present(&frame.png)
                     .map_err(|err| format!("cannot write viewport frame: {err}"))?;
+                if stats.full_frame {
+                    self.metrics.count("full_frames");
+                } else {
+                    self.metrics.count("frame_edits");
+                }
                 if self.frames == 1 {
                     self.metrics
                         .push("frame_bytes_first_frame", &stats.wire_bytes.to_string());
@@ -432,6 +437,21 @@ impl Pager {
         );
         self.metrics
             .push("term", &std::env::var("TERM").unwrap_or_default());
+        self.metrics.push(
+            "term_program_version",
+            &std::env::var("TERM_PROGRAM_VERSION").unwrap_or_default(),
+        );
+        self.metrics.push(
+            "frame_editing",
+            &owner.frame_editing_supported().to_string(),
+        );
+        self.metrics.push(
+            "xtversion",
+            &owner
+                .terminal_identity()
+                .map(|identity| identity.describe())
+                .unwrap_or_default(),
+        );
 
         self.animation_paused = args.pause_animation;
         self.draw(owner, args)?;

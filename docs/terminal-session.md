@@ -70,7 +70,7 @@ same-terminal check. This is what makes
 | `paint_screen(lines)` | Clears and writes a full-screen plain-text frame, one sanitized line per row, with the cursor preserved. Used by the report picker. |
 | `clear_image()` | Deletes the owned image (raw or tmux passthrough), forgets the placement identity and tmux placeholder grid, and forces the next `present` to be a full transmit. Keeps the alternate screen and raw mode open for the picker. |
 | `finish()` | Idempotent delete-image (raw or passthrough) + disable mouse reporting + show-cursor + leave-alternate-screen + restore-termios sequence. Entry requests SGR mouse reports (`?1006h` plus button event tracking `?1000h`) in the same pane output as the alternate screen; tmux options are never changed. |
-| `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `frame_editing_supported()`, `probe_report()` | Diagnostics and metrics. Environment values never choose the mode or geometry; the explicit Ghostty 1.4+ pair is the only frame-editing gate. |
+| `image_id()`, `placement_name()`, `tmux_summary()`, `tmux_visible()`, `environment()`, `frame_editing_supported()`, `probe_report()` | Diagnostics and metrics. Environment values never choose the mode or geometry; the explicit Ghostty program/version pair, or a positive `ghostty >=1.4` XTVERSION reply when those hints are missing, is the only frame-editing gate. |
 
 ## Mode outcomes
 
@@ -147,10 +147,21 @@ while an `a=f` load is pending, recovery first sends a scoped quiet delete
 (`a=d,d=I,i=<id>,q=2`) to abort the partial load, then bootstraps. A failed
 update records the same recovery state, so it is never continued as an edit.
 
-Frame editing is gated deliberately: direct terminals must report
-`TERM_PROGRAM=ghostty` with `TERM_PROGRAM_VERSION` 1.4 or newer, and the tmux
-path relies on detection's single attached Ghostty 1.4+ client. A successful
-basic Kitty graphics query is not treated as proof of frame editing; other
+Frame editing is gated deliberately. `TERM_PROGRAM=ghostty` with
+`TERM_PROGRAM_VERSION` 1.4 or newer is positive evidence and decides without a
+round trip. An explicit older or unusable version, or a conflicting non-empty
+`TERM_PROGRAM`, keeps the full-image behavior. When the program hints are
+missing or have no version, `TERM=xterm-ghostty` only tells the direct probe to
+ask XTVERSION (`CSI > 0 q`) in the same bounded startup budget. Only a reply
+naming `ghostty` at 1.4 or newer enables `a=f`; a pre-1.4, foreign, malformed,
+late-only, or missing reply keeps full frames. Recognized replies are consumed
+by the shared scanner, and split replies retain ordinary keys. If the budget
+ends after valid cell and Kitty replies but mid-reply (say `ESC P >|gh`), the
+scanner's unconsumed tail seeds the live input buffer, so the finishing suffix
+is still consumed as protocol rather than delivered as keys, and it does not
+upgrade the already-decided frame path. The tmux path
+relies on detection's single attached Ghostty 1.4+ client. A successful basic
+Kitty graphics query is not treated as proof of frame editing; other
 Kitty-compatible terminals keep the full-image behavior.
 
 While scrolling at a stable grid size the existing tmux placeholder cells are
@@ -254,7 +265,9 @@ Deterministic pseudo-terminal coverage:
 - steady frame edits (`a=f`) preserve placement and reconstruct the PNG, while
   changed raster/geometry and unsupported terminals bootstrap;
 - two frames reusing one image id and no delete between frames;
-- Ghostty version gating for frame editing;
+- Ghostty program/version and XTVERSION capability gating for frame editing,
+  including accepted, split, late, prefix-completed-after-startup, pre-1.4,
+  foreign, missing-reply, and conflicting-program cases;
 - status-row placement/sanitization/truncation;
 - resize recomputation and rollback on impossible geometry;
 - cleanup after interrupt and after a handled oversized-frame error;
@@ -284,6 +297,16 @@ a real attached client (17×34 cells), complete placeholder grids, pane resize
 and zoom, two simultaneous pagers, window away/back repaint, `q`/Ctrl+C shell
 restoration, stdin, `--text`, redirected output, passthrough-off fallback, and
 the direct Ghostty owner path.
+
+`docs/evidence/direct-ghostty-flicker.md` records the direct Ghostty 1.4.0
+protocol check for `glisk-2hp.16`: with both program hints stripped,
+`TERM=xterm-ghostty` prompts an XTVERSION query, and the actual
+`\x1bP>|ghostty 1.4.0\x1b\\` reply selects frame editing. Ten scripted redraws
+then produce one bootstrap `a=T` plus nine `a=f` frame edits (1156 chunk
+commands) instead of ten `a=T` uploads. A pre-1.4 or absent reply keeps the
+full-frame path. An ordinary no-flag CLI launch is also exercised with the
+program hints stripped: the test waits for the identity reply, scrolls with a
+normal key, and requires the redraw to be an `a=f` edit.
 
 These remain human/compositor checks:
 
