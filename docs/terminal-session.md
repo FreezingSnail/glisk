@@ -9,9 +9,9 @@ the bounded capability/geometry probe, raw mode, the alternate screen, key
 input, Kitty graphics writes, resize geometry, and cleanup. It does not load or
 paint documents, own the keymap, or write plain-text output.
 
-The module is **not wired into `spike/src/main.rs` yet**. Bead `glisk-2hp.8`
-owns that integration; until then the integration test includes the module with
-`#[path = "../src/terminal.rs"]`.
+The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`; the CLI
+opens it only after bounded ingestion and mode selection. The integration test
+also includes the module with `#[path = "../src/terminal.rs"]`.
 
 ## Integration contract
 
@@ -38,11 +38,17 @@ Call order for the pager:
 `TerminalError::Probe` and `TerminalError::Geometry` to the plain-text path and
 reports diagnostics on the normal screen.
 
+On macOS, `fstat` and `poll` on the `/dev/tty` pseudo-device do not identify the
+underlying pts. When `stdin` is not the stdout TTY, the owner opens
+`ttyname(stdout)` instead, then relies on the shared probe as the authoritative
+same-terminal check. This is what makes
+`cat report.html | glisk -` interactive in the tested environment.
+
 ### Public surface
 
 | Item | Contract |
 |---|---|
-| `TerminalOwner::open()` / `open_with_config` | `stdout` must be a TTY. Input is `stdin` when it is the same TTY, otherwise `/dev/tty`, which must resolve to the same terminal device. Failure is an error, never a silent fallback. |
+| `TerminalOwner::open()` / `open_with_config` | `stdout` must be a TTY. Input is `stdin` when it is the same TTY, otherwise the device name behind `stdout` is opened. The shared cell/graphics probe confirms reads and writes reach the same terminal. Failure is an error, never a silent fallback. |
 | `TerminalOwner::from_fds(input, output, config)` | Same checks for already-open descriptors; neither descriptor is closed by the owner. Used by PTY tests. |
 | `geometry()` | Validated grid, content rows above the status row, cell pixels, physical raster, CSS viewport, and derived scale. |
 | `resize` / `resize_with_cell` | Recompute and validate; a failed resize leaves the previous geometry intact. |

@@ -9,10 +9,10 @@ ingestion path in `spike/src/document.rs` has applied the local-only resource
 policy. It does not depend on Kitty, terminal capabilities, fonts, paint, or a
 viewport.
 
-The module is **not wired into `spike/src/main.rs` yet**. The search bead
-(`glisk-2hp.7`) and the CLI/text bead add `mod text;` and call the same API.
-Until then its integration test includes the module with
-`#[path = "../src/text.rs"]`.
+The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`: both
+explicit `--text` and automatic plain-text fallback call
+`text::extract_plain_text` after bounded ingestion. The integration test still
+includes the module with `#[path = "../src/text.rs"]`.
 
 ## API
 

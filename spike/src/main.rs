@@ -1,133 +1,685 @@
-//! Minimal live renderer spike for bead glisk-2hp.1.
+//! Glisk pager CLI.
 //!
-//! Loads one self-contained HTML document with external resources denied,
-//! resolves layout with Blitz, rasterizes a viewport with Vello CPU, and
-//! presents one Kitty graphics placement on the alternate screen.
+//! Reads one local HTML document (or stdin), applies the bounded ingestion and
+//! offline resource policy, then either writes plain text or opens the live
+//! Kitty viewport through the pager modules.
 //!
-//! `snapshot` mode is headless and writes a PNG. `run` mode is interactive.
+//! The hidden `--snapshot`, `--self-test`, `--scripted-actions`, `--once`,
+//! `--dump-dir`, and `--metrics` flags remain as diagnostic entry points for
+//! the renderer evidence recorded in `docs/renderer-spike.md`.
+
+mod document;
+mod navigation;
+mod search;
+mod terminal;
+mod text;
+mod viewport;
 
 use std::{
-    io::{Read, Write},
-    sync::Arc,
+    io::{self, Write},
     time::{Duration, Instant},
 };
 
 use anyrender_vello_cpu::VelloCpuScenePainter;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use blitz_dom::{BaseDocument, DocumentConfig, ScrollBehavior, ScrollLogicalPosition};
-use blitz_html::HtmlDocument;
-use blitz_traits::net::{NetHandler, Request};
-use blitz_traits::shell::{ColorScheme, Viewport};
+use blitz_dom::{BaseDocument, ScrollBehavior, ScrollLogicalPosition};
+use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 use clap::Parser;
-use crossterm::{
-    cursor::{Hide, Show},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
 
-const IMAGE_ID: u32 = 0x474c_4953; // "GLIS"
-const STATUS_ROWS: u16 = 1;
-const CSS_PX_PER_COLUMN: f64 = 8.0;
+use document::{IngestError, IngestedDocument, Limits};
+use navigation::Navigation;
+use search::Search;
+use terminal::{TerminalConfig, TerminalError, TerminalOwner};
+use viewport::{PaintOutcome, ResizeOutcome, Viewport as DocViewport};
+
+const MAX_RASTER_PIXELS: u64 = 8_388_608;
+const TEXT_VIEWPORT_WIDTH: u32 = 420;
+const TEXT_VIEWPORT_HEIGHT: u32 = 900;
 
 #[derive(Parser, Debug)]
-#[command(about = "Glisk Blitz + Kitty renderer spike", version)]
+#[command(about = "Glisk HTML pager", version)]
 struct Args {
-    /// Self-contained HTML document.
-    file: String,
+    /// Local .htm/.html file, or `-` to read the document from stdin.
+    input: String,
 
-    /// Headless mode: write one viewport PNG to this path.
+    /// Write plain UTF-8 text instead of opening the live pager.
     #[arg(long)]
+    text: bool,
+
+    /// Diagnostic: write one viewport PNG to this path.
+    #[arg(long, hide = true)]
     snapshot: Option<String>,
 
-    /// CSS width for --snapshot (default 420).
-    #[arg(long, default_value_t = 420.0)]
+    /// Diagnostic: CSS width for --snapshot.
+    #[arg(long, default_value_t = 420.0, hide = true)]
     css_width: f64,
 
-    /// CSS height for --snapshot (default 900).
-    #[arg(long, default_value_t = 900.0)]
+    /// Diagnostic: CSS height for --snapshot.
+    #[arg(long, default_value_t = 900.0, hide = true)]
     css_height: f64,
 
-    /// Device scale for --snapshot (default 2.0).
-    #[arg(long, default_value_t = 2.0)]
+    /// Diagnostic: device scale for --snapshot.
+    #[arg(long, default_value_t = 2.0, hide = true)]
     scale: f64,
 
-    /// Scroll to an element id before painting / opening.
-    #[arg(long)]
+    /// Diagnostic: scroll to an element id before painting or opening.
+    #[arg(long, hide = true)]
     fragment: Option<String>,
 
-    /// Toggle a <details> element id before painting / opening.
-    #[arg(long)]
+    /// Diagnostic: toggle a <details> element id before painting or opening.
+    #[arg(long, hide = true)]
     toggle: Option<String>,
 
-    /// Focus the first node matching this CSS selector before painting.
-    #[arg(long)]
+    /// Diagnostic: focus the first node matching this CSS selector.
+    #[arg(long, hide = true)]
     focus: Option<String>,
 
-    /// Open, draw once, then exit (useful for screenshots).
-    #[arg(long)]
+    /// Diagnostic: draw once, wait briefly, then exit.
+    #[arg(long, hide = true)]
     once: bool,
 
-    /// After the first frame, run a fixed action sequence through the live
-    /// handlers and record action-to-frame-write timings. This is not OS
-    /// keyboard injection; the terminal keys are not exercised.
-    #[arg(long)]
+    /// Diagnostic: run a fixed action sequence through the live handlers.
+    #[arg(long, hide = true)]
     scripted_actions: bool,
 
-    /// Cell width in device pixels when the terminal does not answer CSI 16t.
-    #[arg(long)]
-    cell_width_px: Option<u16>,
-
-    /// Cell height in device pixels when the terminal does not answer CSI 16t.
-    #[arg(long)]
-    cell_height_px: Option<u16>,
-
-    /// Run the headless interaction and resize state assertions.
-    #[arg(long)]
+    /// Diagnostic: run headless interaction and resize assertions.
+    #[arg(long, hide = true)]
     self_test: bool,
 
-    /// Write every live PNG frame into this directory.
-    #[arg(long)]
+    /// Diagnostic: write every live PNG frame into this directory.
+    #[arg(long, hide = true)]
     dump_dir: Option<String>,
 
-    /// Write key=value metrics here when the process exits.
-    #[arg(long)]
+    /// Diagnostic: write key=value metrics here when the process exits.
+    #[arg(long, hide = true)]
     metrics: Option<String>,
 }
 
 fn main() {
     let started = Instant::now();
     let args = Args::parse();
-    let html = match std::fs::read_to_string(&args.file) {
-        Ok(html) => html,
-        Err(err) => {
-            eprintln!("glisk-spike: cannot read {}: {err}", args.file);
-            std::process::exit(1);
-        }
-    };
 
     let result = if args.self_test {
-        self_test(&args, &html, started)
+        self_test(&args, started)
     } else if let Some(path) = &args.snapshot {
-        snapshot(&args, &html, path, started)
+        snapshot(&args, path, started)
     } else {
-        live(&args, &html, started)
+        run_cli(&args, started)
     };
 
     if let Err(err) = result {
-        eprintln!("glisk-spike: {err}");
+        eprintln!("glisk: {err}");
         std::process::exit(1);
     }
 }
 
-fn self_test(args: &Args, html: &str, started: Instant) -> Result<(), String> {
+fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
+    // Ingest with a deterministic text viewport first. The live path re-lays
+    // out the same live document at terminal geometry after the owner opens.
+    let ingested = ingest_source(&args.input, text_viewport())?;
+
+    if args.text || !terminal::is_tty(libc::STDOUT_FILENO) {
+        return write_plain_text(&ingested.document);
+    }
+
+    match TerminalOwner::open_with_config(TerminalConfig::default()) {
+        Ok(owner) => run_pager(args, ingested, owner, started),
+        Err(err) => {
+            eprintln!("glisk: graphics unavailable: {err}; using plain text");
+            write_plain_text(&ingested.document)
+        }
+    }
+}
+
+fn text_viewport() -> BlitzViewport {
+    BlitzViewport::new(
+        TEXT_VIEWPORT_WIDTH,
+        TEXT_VIEWPORT_HEIGHT,
+        1.0,
+        ColorScheme::Dark,
+    )
+}
+
+fn ingest_source(input: &str, viewport: BlitzViewport) -> Result<IngestedDocument, String> {
+    if input != "-" && looks_like_url(input) {
+        return Err("only local .htm/.html files or `-` for stdin are supported".to_string());
+    }
+    let result = if input == "-" {
+        document::ingest_stdin(viewport, Limits::default())
+    } else {
+        document::ingest_file(input, viewport, Limits::default())
+    };
+    result.map_err(|err| IngestError::to_string(&err))
+}
+
+/// Reject URL-shaped arguments before they reach the filesystem. Glisk is a
+/// local document pager, not a browser.
+fn looks_like_url(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    const SCHEMES: [&str; 8] = [
+        "http://", "https://", "file://", "data:", "ws://", "wss://", "ftp://", "about:",
+    ];
+    SCHEMES.iter().any(|scheme| lower.starts_with(scheme))
+}
+
+fn write_plain_text(document: &BaseDocument) -> Result<(), String> {
+    let text = text::extract_plain_text(document);
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(format!("cannot write plain text: {err}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live pager
+// ---------------------------------------------------------------------------
+
+struct Pager {
+    view: DocViewport,
+    navigation: Navigation,
+    search: Search,
+    frames: u32,
+    metrics: Metrics,
+}
+
+impl Pager {
+    fn new(document: BaseDocument, width: u32, height: u32, scale: f64) -> Self {
+        Self {
+            view: DocViewport::new(document, width, height, scale),
+            navigation: Navigation::new(),
+            search: Search::new(),
+            frames: 0,
+            metrics: Metrics::new(),
+        }
+    }
+
+    fn prepare(&mut self, args: &Args) -> Result<(), String> {
+        if let Some(id) = &args.toggle {
+            let node = self
+                .view
+                .document()
+                .get_element_by_id(id)
+                .ok_or_else(|| format!("no element with id {id:?}"))?;
+            self.view.document_mut().toggle_details_open(node);
+            self.view.document_mut().resolve(0.0);
+        }
+        if let Some(selector) = &args.focus {
+            let node = self
+                .view
+                .document()
+                .query_selector(selector)
+                .map_err(|err| format!("bad selector {selector:?}: {err:?}"))?
+                .ok_or_else(|| format!("no element matches {selector:?}"))?;
+            self.view.document_mut().set_focus_to(node);
+            self.view.document_mut().resolve(0.0);
+            self.view.document_mut().scroll_into_view(
+                node,
+                ScrollBehavior::Instant,
+                ScrollLogicalPosition::Nearest,
+                ScrollLogicalPosition::Nearest,
+            );
+        }
+        if let Some(fragment) = &args.fragment {
+            if !matches!(
+                self.navigation.jump_to_fragment(&mut self.view, fragment),
+                navigation::FragmentJump::Jumped(_)
+            ) {
+                return Err(format!("no fragment target {fragment:?}"));
+            }
+        }
+        self.view.document_mut().resolve(0.0);
+        Ok(())
+    }
+
+    fn draw(&mut self, owner: &mut TerminalOwner, args: &Args) -> Result<(), String> {
+        match self
+            .view
+            .paint()
+            .map_err(|err| format!("cannot paint viewport: {err}"))?
+        {
+            PaintOutcome::Frame(frame) => {
+                self.frames += 1;
+                if let Some(dir) = args.dump_dir.as_deref() {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|err| format!("cannot create {dir}: {err}"))?;
+                    let path = format!("{dir}/frame-{:03}.png", self.frames);
+                    std::fs::write(&path, &frame.png)
+                        .map_err(|err| format!("cannot write {path}: {err}"))?;
+                }
+                if self.frames == 1 {
+                    self.metrics
+                        .push("png_bytes_first_frame", &frame.png.len().to_string());
+                }
+                let stats = owner
+                    .present(&frame.png)
+                    .map_err(|err| format!("cannot write viewport frame: {err}"))?;
+                if self.frames == 1 {
+                    self.metrics
+                        .push("frame_bytes_first_frame", &stats.wire_bytes.to_string());
+                }
+            }
+            PaintOutcome::Skipped(reason) => {
+                self.metrics.push("last_paint_skipped", &reason.to_string());
+            }
+        }
+        let status = self.status_text();
+        owner
+            .paint_status(&status)
+            .map_err(|err| format!("cannot write status row: {err}"))
+    }
+
+    fn status_text(&mut self) -> String {
+        let max_scroll = self.view.max_scroll();
+        let scroll = self.view.scroll_y();
+        let percent = if max_scroll > 0.0 {
+            (scroll / max_scroll * 100.0).round().clamp(0.0, 100.0)
+        } else {
+            100.0
+        };
+        format!(
+            "glisk | {percent:.0}% | {} | {} | Tab focus  Enter open  / search  j/k scroll  q quit",
+            self.search.status(),
+            self.navigation.status()
+        )
+    }
+
+    fn run(
+        &mut self,
+        args: &Args,
+        owner: &mut TerminalOwner,
+        started: Instant,
+    ) -> Result<(), String> {
+        self.metrics.push(
+            "term_program",
+            &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        );
+        self.metrics
+            .push("term", &std::env::var("TERM").unwrap_or_default());
+
+        self.draw(owner, args)?;
+        self.metrics.push(
+            "cold_start_to_frame_write_ms",
+            &format_ms(started.elapsed()),
+        );
+
+        if args.scripted_actions {
+            self.run_scripted_actions(args, owner)?;
+            self.metrics.push("frames", &self.frames.to_string());
+            note_rss(&mut self.metrics);
+            self.metrics.write(args.metrics.as_deref())?;
+            return Ok(());
+        }
+
+        if args.once {
+            let _ = io::stdout().flush();
+            std::thread::sleep(Duration::from_millis(700));
+            self.metrics.push("frames", &self.frames.to_string());
+            note_rss(&mut self.metrics);
+            self.metrics.write(args.metrics.as_deref())?;
+            return Ok(());
+        }
+
+        loop {
+            let batch = owner
+                .poll_input(Duration::from_millis(100))
+                .map_err(terminal_message)?;
+            let mut changed = false;
+            let mut quit = false;
+
+            if let Some(batch) = batch {
+                if batch.interrupt {
+                    quit = true;
+                } else {
+                    for key in parse_keys(&batch.bytes) {
+                        changed |= self.handle_key(key, &mut quit);
+                    }
+                }
+            }
+            if quit {
+                break;
+            }
+
+            if let Some(geometry) = owner.refresh_size().map_err(terminal_message)? {
+                let (width, height) = geometry.physical_size();
+                if matches!(
+                    self.view.resize(width, height, geometry.scale()),
+                    ResizeOutcome::Applied(_)
+                ) {
+                    changed = true;
+                }
+            }
+
+            if changed {
+                self.draw(owner, args)?;
+            }
+        }
+
+        self.metrics.push("frames", &self.frames.to_string());
+        note_rss(&mut self.metrics);
+        self.metrics.write(args.metrics.as_deref())
+    }
+
+    fn handle_key(&mut self, key: Key, quit: &mut bool) -> bool {
+        if self.search.is_editing() {
+            return match key {
+                Key::Enter => {
+                    let text = text::extract(self.view.document());
+                    self.search
+                        .commit(&text, &mut self.view, &mut self.navigation);
+                    true
+                }
+                Key::Escape => {
+                    self.search.cancel();
+                    true
+                }
+                Key::Backspace => self.search.backspace(),
+                Key::Char(ch) => self.search.push_char(ch),
+                _ => false,
+            };
+        }
+
+        match key {
+            Key::Char('q') => {
+                *quit = true;
+                false
+            }
+            Key::Char('j') | Key::Down => self.view.scroll_by(40.0),
+            Key::Char('k') | Key::Up => self.view.scroll_by(-40.0),
+            Key::Char(' ') | Key::PageDown => self.view.scroll_page(1.0),
+            Key::PageUp => self.view.scroll_page(-1.0),
+            Key::Char('g') | Key::Home => self.view.scroll_home(),
+            Key::Char('G') | Key::End => self.view.scroll_end(),
+            Key::Tab => {
+                self.navigation.focus_next(&mut self.view);
+                true
+            }
+            Key::BackTab => {
+                self.navigation.focus_prev(&mut self.view);
+                true
+            }
+            Key::Enter => {
+                self.navigation.activate(&mut self.view);
+                true
+            }
+            Key::Char('/') => {
+                self.search.begin();
+                true
+            }
+            Key::Char('n') => {
+                self.search.next(&mut self.view, &mut self.navigation);
+                true
+            }
+            Key::Char('N') => {
+                self.search.previous(&mut self.view, &mut self.navigation);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn run_scripted_actions(
+        &mut self,
+        args: &Args,
+        owner: &mut TerminalOwner,
+    ) -> Result<(), String> {
+        let mut durations = Vec::new();
+        for action in ScriptedAction::SEQUENCE {
+            let at = Instant::now();
+            self.apply_scripted(action);
+            self.draw(owner, args)?;
+            durations.push(at.elapsed());
+        }
+        let average = durations.iter().map(Duration::as_secs_f64).sum::<f64>()
+            / durations.len().max(1) as f64
+            * 1000.0;
+        self.metrics
+            .push("scripted_action_frames", &durations.len().to_string());
+        self.metrics.push(
+            "scripted_action_to_frame_write_avg_ms",
+            &format!("{average:.1}"),
+        );
+        Ok(())
+    }
+
+    fn apply_scripted(&mut self, action: ScriptedAction) {
+        match action {
+            ScriptedAction::FocusNext => {
+                self.navigation.focus_next(&mut self.view);
+            }
+            ScriptedAction::Activate => {
+                self.navigation.activate(&mut self.view);
+            }
+            ScriptedAction::Anchor(fragment) => {
+                self.navigation.jump_to_fragment(&mut self.view, fragment);
+            }
+            ScriptedAction::Scroll(delta) => {
+                self.view.scroll_by(delta);
+            }
+            ScriptedAction::Toggle(id) => {
+                if let Some(node) = self.view.document().get_element_by_id(id) {
+                    self.view.document_mut().toggle_details_open(node);
+                    self.view.document_mut().resolve(0.0);
+                }
+            }
+        }
+    }
+}
+
+fn run_pager(
+    args: &Args,
+    ingested: IngestedDocument,
+    mut owner: TerminalOwner,
+    started: Instant,
+) -> Result<(), String> {
+    let geometry = owner.geometry();
+    let (width, height) = geometry.physical_size();
+    let mut pager = Pager::new(ingested.document, width, height, geometry.scale());
+    pager.metrics.push("mode", "live");
+    pager.metrics.push("cols", &geometry.cols().to_string());
+    pager.metrics.push("rows", &geometry.rows().to_string());
+    let cell = geometry.cell();
+    pager
+        .metrics
+        .push("cell_width_px", &cell.width().to_string());
+    pager
+        .metrics
+        .push("cell_height_px", &cell.height().to_string());
+    let (css_width, css_height) = geometry.css_size();
+    pager.metrics.push("css_width", &format!("{css_width:.1}"));
+    pager
+        .metrics
+        .push("css_height", &format!("{css_height:.1}"));
+    pager
+        .metrics
+        .push("scale", &format!("{:.3}", geometry.scale()));
+    pager
+        .metrics
+        .push("document_nodes", &ingested.stats.nodes.to_string());
+
+    if let Err(err) = pager.prepare(args) {
+        let _ = owner.finish();
+        return Err(err);
+    }
+
+    let result = pager.run(args, &mut owner, started);
+    let finish = owner.finish().map_err(terminal_message);
+    match (result, finish) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn terminal_message(err: TerminalError) -> String {
+    format!("terminal: {err}")
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedAction {
+    FocusNext,
+    Activate,
+    Anchor(&'static str),
+    Scroll(f64),
+    Toggle(&'static str),
+}
+
+impl ScriptedAction {
+    const SEQUENCE: [Self; 9] = [
+        Self::FocusNext,
+        Self::Activate,
+        Self::FocusNext,
+        Self::Activate,
+        Self::Anchor("chart"),
+        Self::Scroll(40.0),
+        Self::Scroll(-40.0),
+        Self::Anchor("evidence"),
+        Self::Toggle("evidence-method"),
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// Input keys
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Escape,
+    Enter,
+    Tab,
+    BackTab,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Char(char),
+    Unknown,
+}
+
+/// Parse the ordinary key bytes returned by the terminal owner. The owner has
+/// already separated protocol replies and retained incomplete sequences, so
+/// every escape sequence here is complete.
+fn parse_keys(bytes: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                if i + 1 >= bytes.len() {
+                    keys.push(Key::Escape);
+                    i += 1;
+                    continue;
+                }
+                match bytes[i + 1] {
+                    b'[' => {
+                        let start = i + 2;
+                        let mut end = start;
+                        while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                            end += 1;
+                        }
+                        if end >= bytes.len() {
+                            keys.push(Key::Unknown);
+                            break;
+                        }
+                        let params = &bytes[start..end];
+                        keys.push(match bytes[end] {
+                            b'A' => Key::Up,
+                            b'B' => Key::Down,
+                            b'C' => Key::Right,
+                            b'D' => Key::Left,
+                            b'H' => Key::Home,
+                            b'F' => Key::End,
+                            b'Z' => Key::BackTab,
+                            b'~' => match params {
+                                b"1" | b"7" => Key::Home,
+                                b"4" | b"8" => Key::End,
+                                b"5" => Key::PageUp,
+                                b"6" => Key::PageDown,
+                                b"3" => Key::Backspace,
+                                _ => Key::Unknown,
+                            },
+                            _ => Key::Unknown,
+                        });
+                        i = end + 1;
+                    }
+                    b'O' => {
+                        if i + 2 >= bytes.len() {
+                            keys.push(Key::Escape);
+                            i += 1;
+                            continue;
+                        }
+                        keys.push(match bytes[i + 2] {
+                            b'A' => Key::Up,
+                            b'B' => Key::Down,
+                            b'C' => Key::Right,
+                            b'D' => Key::Left,
+                            b'H' => Key::Home,
+                            b'F' => Key::End,
+                            _ => Key::Unknown,
+                        });
+                        i += 3;
+                    }
+                    _ => {
+                        // Alt+key: report Escape, then the key on the next pass.
+                        keys.push(Key::Escape);
+                        i += 1;
+                    }
+                }
+            }
+            b'\t' => {
+                keys.push(Key::Tab);
+                i += 1;
+            }
+            b'\r' | b'\n' => {
+                keys.push(Key::Enter);
+                i += 1;
+            }
+            0x7f | 0x08 => {
+                keys.push(Key::Backspace);
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                while i < bytes.len()
+                    && !matches!(bytes[i], 0x1b | b'\t' | b'\r' | b'\n' | 0x7f | 0x08)
+                {
+                    i += 1;
+                }
+                for ch in String::from_utf8_lossy(&bytes[start..i]).chars() {
+                    keys.push(Key::Char(ch));
+                }
+            }
+        }
+    }
+    keys
+}
+
+// ---------------------------------------------------------------------------
+// Legacy headless diagnostics
+// ---------------------------------------------------------------------------
+
+fn self_test(args: &Args, started: Instant) -> Result<(), String> {
     use blitz_dom::{ScrollBehavior, ScrollLogicalPosition, local_name};
 
     let mut metrics = Metrics::new();
     metrics.push("mode", "self-test");
 
-    let narrow = Geometry::from_parts(52, 57, 16, 32); // 420x1792 CSS-equivalent at 2x
-    let wide = Geometry::from_parts(125, 57, 16, 32); // 1000x1792 CSS-equivalent at 2x
-    let mut doc = load(html, narrow.phys_w, narrow.phys_h, narrow.scale as f32)?;
+    let scale = 2.0;
+    let (narrow_w, narrow_h) = (840, 1792);
+    let (wide_w, wide_h) = (2000, 1792);
+    let ingested = ingest_source(
+        &args.input,
+        BlitzViewport::new(narrow_w, narrow_h, scale as f32, ColorScheme::Dark),
+    )?;
+    let mut doc = ingested.document;
 
     let link = doc
         .query_selector("a[href='#comparison']")
@@ -162,10 +714,10 @@ fn self_test(args: &Args, html: &str, started: Instant) -> Result<(), String> {
     }
     let focus_before = doc.get_focussed_node_id();
 
-    doc.set_viewport(Viewport::new(
-        wide.phys_w,
-        wide.phys_h,
-        wide.scale as f32,
+    doc.set_viewport(BlitzViewport::new(
+        wide_w,
+        wide_h,
+        scale as f32,
         ColorScheme::Dark,
     ));
     doc.resolve(0.0);
@@ -185,21 +737,28 @@ fn self_test(args: &Args, html: &str, started: Instant) -> Result<(), String> {
     }
     metrics.push("open_disclosure_after_resize", "true");
     metrics.push("focus_retained_after_resize", "true");
-    metrics.push("resize_css_width", &format!("{:.1}", wide.css_w));
-    metrics.push("resize_css_height", &format!("{:.1}", wide.css_h));
+    metrics.push("resize_css_width", &format!("{:.1}", wide_w as f64 / scale));
+    metrics.push(
+        "resize_css_height",
+        &format!("{:.1}", wide_h as f64 / scale),
+    );
     metrics.push("cold_start_to_self_test_ms", &format_ms(started.elapsed()));
     metrics.push("result", "pass");
     note_rss(&mut metrics);
     metrics.write(args.metrics.as_deref())?;
-    eprintln!("glisk-spike: self-test passed");
+    eprintln!("glisk: self-test passed");
     Ok(())
 }
 
-fn snapshot(args: &Args, html: &str, path: &str, started: Instant) -> Result<(), String> {
+fn snapshot(args: &Args, path: &str, started: Instant) -> Result<(), String> {
     let width = (args.css_width * args.scale).round() as u32;
     let height = (args.css_height * args.scale).round() as u32;
     check_viewport(width, height)?;
-    let mut doc = load(html, width, height, args.scale as f32)?;
+    let ingested = ingest_source(
+        &args.input,
+        BlitzViewport::new(width, height, args.scale as f32, ColorScheme::Dark),
+    )?;
+    let mut doc = ingested.document;
     prepare(&mut doc, args)?;
     let png = render(&mut doc, width, height, args.scale)?;
     std::fs::write(path, &png).map_err(|e| format!("cannot write {path}: {e}"))?;
@@ -216,256 +775,18 @@ fn snapshot(args: &Args, html: &str, path: &str, started: Instant) -> Result<(),
     note_rss(&mut metrics);
     metrics.write(args.metrics.as_deref())?;
     eprintln!(
-        "glisk-spike: snapshot {width}x{height}px {} bytes in {:.1} ms -> {path}",
+        "glisk: snapshot {width}x{height}px {} bytes in {:.1} ms -> {path}",
         png.len(),
         elapsed.as_secs_f64() * 1000.0
     );
     Ok(())
 }
 
-fn live(args: &Args, html: &str, started: Instant) -> Result<(), String> {
-    let mut session = Session::enter()?;
-    let mut input = Input::new();
-    let mut geo = Geometry::new(args, session.size()?, &mut input);
-    let mut doc = load(html, geo.phys_w, geo.phys_h, geo.scale as f32)?;
-    prepare(&mut doc, args)?;
-
-    let mut metrics = Metrics::new();
-    metrics.push("mode", "live");
-    metrics.push(
-        "term_program",
-        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-    );
-    metrics.push("term", &std::env::var("TERM").unwrap_or_default());
-    metrics.push("cell_width_px", &geo.cell_w.to_string());
-    metrics.push("cell_height_px", &geo.cell_h.to_string());
-    metrics.push("cols", &geo.cols.to_string());
-    metrics.push("rows", &geo.rows.to_string());
-    metrics.push("css_width", &format!("{:.1}", geo.css_w));
-    metrics.push("css_height", &format!("{:.1}", geo.css_h));
-    metrics.push("scale", &format!("{:.3}", geo.scale));
-
-    let mut key_durations = Vec::new();
-    let mut frame_count = 0u32;
-    let mut last_draw = draw(
-        &mut doc,
-        &geo,
-        &mut session,
-        &mut frame_count,
-        args.dump_dir.as_deref(),
-    )?;
-    let first = started.elapsed();
-    metrics.push("cold_start_to_frame_write_ms", &format_ms(first));
-    metrics.push("png_bytes_first_frame", &last_draw.0.to_string());
-    metrics.push("frame_bytes_first_frame", &last_draw.1.to_string());
-
-    if args.scripted_actions {
-        let script = [
-            Action::FocusNext,
-            Action::Activate,
-            Action::FocusNext,
-            Action::Activate,
-            Action::Anchor("chart".to_string()),
-            Action::Scroll(40.0),
-            Action::Scroll(-40.0),
-            Action::Anchor("evidence".to_string()),
-            Action::Toggle("evidence-method".to_string()),
-        ];
-        for action in script {
-            let at = Instant::now();
-            apply_action(&mut doc, action);
-            doc.resolve(0.0);
-            last_draw = draw(
-                &mut doc,
-                &geo,
-                &mut session,
-                &mut frame_count,
-                args.dump_dir.as_deref(),
-            )?;
-            session.status(&doc, &geo)?;
-            key_durations.push(at.elapsed());
-        }
-        let avg: f64 = key_durations
-            .iter()
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .sum::<f64>()
-            / key_durations.len() as f64;
-        metrics.push("scripted_action_frames", &key_durations.len().to_string());
-        metrics.push(
-            "scripted_action_to_frame_write_last_ms",
-            &format_ms(*key_durations.last().unwrap()),
-        );
-        metrics.push(
-            "scripted_action_to_frame_write_avg_ms",
-            &format!("{avg:.1}"),
-        );
-        metrics.push("png_bytes_last", &last_draw.0.to_string());
-        metrics.push("frame_bytes_last", &last_draw.1.to_string());
-        metrics.push("frames", &frame_count.to_string());
-        note_rss(&mut metrics);
-        metrics.write(args.metrics.as_deref())?;
-        return Ok(());
-    }
-
-    if args.once {
-        let _ = std::io::stdout().flush();
-        std::thread::sleep(Duration::from_millis(700));
-        metrics.push("frames", &frame_count.to_string());
-        note_rss(&mut metrics);
-        metrics.write(args.metrics.as_deref())?;
-        return Ok(());
-    }
-
-    loop {
-        let wait_key = Instant::now();
-        let actions = input.next_actions(100);
-        let key_at = wait_key.elapsed();
-
-        if actions.is_empty() {
-            if input.resized(&mut geo, session.size()?) {
-                geo.apply(&mut doc);
-                last_draw = draw(
-                    &mut doc,
-                    &geo,
-                    &mut session,
-                    &mut frame_count,
-                    args.dump_dir.as_deref(),
-                )?;
-                session.status(&doc, &geo)?;
-                metrics.push("last_resize_frame", &frame_count.to_string());
-            }
-            continue;
-        }
-
-        for action in actions {
-            if matches!(action, Action::Quit) {
-                metrics.push("frames", &frame_count.to_string());
-                metrics.push(
-                    "key_to_frame_write_last_ms",
-                    &format_ms(*key_durations.last().unwrap_or(&Duration::ZERO)),
-                );
-                if !key_durations.is_empty() {
-                    let avg: f64 = key_durations
-                        .iter()
-                        .map(|d| d.as_secs_f64() * 1000.0)
-                        .sum::<f64>()
-                        / key_durations.len() as f64;
-                    metrics.push("key_to_frame_write_avg_ms", &format!("{avg:.1}"));
-                }
-                metrics.push("key_frames", &key_durations.len().to_string());
-                metrics.push("png_bytes_last", &last_draw.0.to_string());
-                metrics.push("frame_bytes_last", &last_draw.1.to_string());
-                note_rss(&mut metrics);
-                metrics.write(args.metrics.as_deref())?;
-                return Ok(());
-            }
-            apply_action(&mut doc, action);
-        }
-
-        doc.resolve(0.0);
-        last_draw = draw(
-            &mut doc,
-            &geo,
-            &mut session,
-            &mut frame_count,
-            args.dump_dir.as_deref(),
-        )?;
-        session.status(&doc, &geo)?;
-        key_durations.push(key_at);
-        if key_durations.len() > 200 {
-            key_durations.remove(0);
-        }
-    }
-}
-
-fn draw(
-    doc: &mut BaseDocument,
-    geo: &Geometry,
-    session: &mut Session,
-    frame_count: &mut u32,
-    dump_dir: Option<&str>,
-) -> Result<(usize, usize), String> {
-    let png = render(doc, geo.phys_w, geo.phys_h, geo.scale)?;
-    *frame_count += 1;
-    if let Some(dir) = dump_dir {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {dir}: {e}"))?;
-        let path = format!("{dir}/frame-{frame_count:03}.png");
-        std::fs::write(&path, &png).map_err(|e| format!("cannot write {path}: {e}"))?;
-    }
-    let frame_bytes = session.present(&png, geo.cols, geo.rows - STATUS_ROWS)?;
-    Ok((png.len(), frame_bytes))
-}
-
-fn apply_action(doc: &mut BaseDocument, action: Action) {
-    match action {
-        Action::Scroll(delta) => {
-            doc.scroll_viewport_by_has_changed(0.0, -delta);
-        }
-        Action::FocusNext => {
-            let next = doc
-                .get_focussed_node_id()
-                .and_then(|_| doc.focus_next_node())
-                .or_else(|| first_focusable(doc).filter(|id| doc.set_focus_to(*id)));
-            if let Some(id) = next {
-                doc.scroll_into_view(
-                    id,
-                    ScrollBehavior::Instant,
-                    ScrollLogicalPosition::Nearest,
-                    ScrollLogicalPosition::Nearest,
-                );
-            }
-        }
-        Action::FocusPrev => {
-            let prev = doc
-                .get_focussed_node_id()
-                .and_then(|_| doc.focus_prev_node())
-                .or_else(|| first_focusable(doc).filter(|id| doc.set_focus_to(*id)));
-            if let Some(id) = prev {
-                doc.scroll_into_view(
-                    id,
-                    ScrollBehavior::Instant,
-                    ScrollLogicalPosition::Nearest,
-                    ScrollLogicalPosition::Nearest,
-                );
-            }
-        }
-        Action::Activate => activate(doc),
-        Action::Home => doc.set_viewport_scroll(blitz_dom::Point { x: 0.0, y: 0.0 }),
-        Action::End => {
-            doc.scroll_viewport_by_has_changed(0.0, -1.0e9);
-        }
-        Action::Anchor(id) => {
-            doc.scroll_to_fragment(&id);
-        }
-        Action::Toggle(id) => {
-            if let Some(node) = doc.get_element_by_id(&id) {
-                doc.toggle_details_open(node);
-            }
-        }
-        Action::Quit => {}
-    }
-}
-
-fn load(html: &str, phys_w: u32, phys_h: u32, scale: f32) -> Result<BaseDocument, String> {
-    check_viewport(phys_w, phys_h)?;
-    let config = DocumentConfig {
-        viewport: Some(Viewport::new(phys_w, phys_h, scale, ColorScheme::Dark)),
-        base_url: Some("glisk://report/reference.html".to_string()),
-        net_provider: Some(Arc::new(DenyNetProvider)),
-        html_parser_provider: None,
-        ..Default::default()
-    };
-    let mut doc = HtmlDocument::from_html(html, config).into_inner();
-    doc.resolve(0.0);
-    Ok(doc)
-}
-
 fn check_viewport(w: u32, h: u32) -> Result<(), String> {
-    const MAX_PIXELS: u64 = 8_388_608;
     if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
         return Err(format!("invalid viewport {w}x{h}"));
     }
-    if w as u64 * h as u64 > MAX_PIXELS {
+    if u64::from(w) * u64::from(h) > MAX_RASTER_PIXELS {
         return Err(format!("viewport {w}x{h} exceeds the 8,388,608 pixel cap"));
     }
     Ok(())
@@ -509,18 +830,6 @@ fn render(doc: &mut BaseDocument, phys_w: u32, phys_h: u32, scale: f64) -> Resul
     pixmap
         .into_png()
         .map_err(|e| format!("PNG encode failed: {e:?}"))
-}
-
-fn first_focusable(doc: &BaseDocument) -> Option<blitz_dom::NodeId> {
-    let mut id = doc.root_node().id;
-    for _ in 0..20_000 {
-        let node = doc.get_node(id)?;
-        if node.is_focussable() {
-            return Some(id);
-        }
-        id = doc.next_node(node, |_| true)?;
-    }
-    None
 }
 
 fn tag_name(doc: &BaseDocument, id: blitz_dom::NodeId) -> Option<String> {
@@ -570,348 +879,9 @@ fn activate(doc: &mut BaseDocument) {
     }
 }
 
-struct Geometry {
-    cols: u16,
-    rows: u16,
-    cell_w: u16,
-    cell_h: u16,
-    phys_w: u32,
-    phys_h: u32,
-    css_w: f64,
-    css_h: f64,
-    scale: f64,
-}
-
-impl Geometry {
-    fn new(args: &Args, (cols, rows): (u16, u16), input: &mut Input) -> Self {
-        let (cell_w, cell_h) = input
-            .probe_cell_pixels()
-            .or(match (args.cell_width_px, args.cell_height_px) {
-                (Some(w), Some(h)) => Some((w, h)),
-                _ => None,
-            })
-            .unwrap_or((8, 16));
-        Self::from_parts(cols, rows, cell_w, cell_h)
-    }
-
-    fn from_parts(cols: u16, rows: u16, cell_w: u16, cell_h: u16) -> Self {
-        let cols = cols.max(2);
-        let rows = rows.max(2);
-        let cell_w = cell_w.max(1);
-        let cell_h = cell_h.max(1);
-        let phys_w = cols as u32 * cell_w as u32;
-        let phys_h = (rows as u32 - STATUS_ROWS as u32) * cell_h as u32;
-        let scale = cell_w as f64 / CSS_PX_PER_COLUMN;
-        let css_w = phys_w as f64 / scale;
-        let css_h = phys_h as f64 / scale;
-        Self {
-            cols,
-            rows,
-            cell_w,
-            cell_h,
-            phys_w,
-            phys_h,
-            css_w,
-            css_h,
-            scale,
-        }
-    }
-
-    fn apply(&self, doc: &mut BaseDocument) {
-        doc.set_viewport(Viewport::new(
-            self.phys_w,
-            self.phys_h,
-            self.scale as f32,
-            ColorScheme::Dark,
-        ));
-        doc.resolve(0.0);
-    }
-}
-
-struct Session {
-    stdout: std::io::Stdout,
-}
-
-impl Session {
-    fn enter() -> Result<Self, String> {
-        enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
-        let mut stdout = std::io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
-            let _ = disable_raw_mode();
-            return Err(format!("alternate screen: {err}"));
-        }
-        Ok(Self { stdout })
-    }
-
-    fn size(&self) -> Result<(u16, u16), String> {
-        crossterm::terminal::size().map_err(|e| format!("terminal size: {e}"))
-    }
-
-    fn present(&mut self, png: &[u8], cols: u16, rows: u16) -> Result<usize, String> {
-        let frame = kitty_frame(png, cols, rows);
-        let len = frame.len();
-        self.stdout
-            .write_all(&frame)
-            .and_then(|_| self.stdout.flush())
-            .map_err(|e| format!("frame write: {e}"))?;
-        Ok(len)
-    }
-
-    fn status(&mut self, doc: &BaseDocument, geo: &Geometry) -> Result<(), String> {
-        let focus = doc
-            .get_focussed_node_id()
-            .and_then(|id| doc.get_node(id))
-            .and_then(|n| n.element_data())
-            .and_then(|e| e.id.as_ref().map(|id| id.to_string()))
-            .unwrap_or_else(|| "-".to_string());
-        let mut text = format!(
-            "glisk-spike | {}x{} cells | {}x{}px | {:.1}x{:.1} CSS | scale {:.2} | focus {} | Tab focus  Enter open  j/k scroll  q quit",
-            geo.cols, geo.rows, geo.cell_w, geo.cell_h, geo.css_w, geo.css_h, geo.scale, focus
-        );
-        let max = geo.cols as usize;
-        if text.chars().count() > max {
-            text = text.chars().take(max.saturating_sub(1)).collect::<String>() + "…";
-        }
-        let seq = format!("\x1b[{};1H\x1b[2K{}", geo.rows, text);
-        self.stdout
-            .write_all(seq.as_bytes())
-            .and_then(|_| self.stdout.flush())
-            .map_err(|e| format!("status write: {e}"))
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let delete = format!("\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\");
-        let _ = self.stdout.write_all(delete.as_bytes());
-        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-        let _ = self.stdout.flush();
-    }
-}
-
-fn kitty_frame(png: &[u8], cols: u16, rows: u16) -> Vec<u8> {
-    let encoded = BASE64.encode(png);
-    let mut out = Vec::with_capacity(encoded.len() + 128);
-    out.extend_from_slice(b"\x1b[H");
-    let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4000).collect();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let more = usize::from(i + 1 < chunks.len());
-        if i == 0 {
-            out.extend_from_slice(
-                format!("\x1b_Ga=T,f=100,i={IMAGE_ID},q=2,C=1,c={cols},r={rows},m={more};")
-                    .as_bytes(),
-            );
-        } else {
-            out.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
-        }
-        out.extend_from_slice(chunk);
-        out.extend_from_slice(b"\x1b\\");
-    }
-    out
-}
-
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Session")
-    }
-}
-
-/// Deny every document-directed resource. The document is fully inline.
-#[derive(Debug)]
-struct DenyNetProvider;
-
-impl blitz_traits::net::NetProvider for DenyNetProvider {
-    fn fetch(&self, _doc_id: usize, request: Request, _handler: Box<dyn NetHandler>) {
-        eprintln!("glisk-spike: blocked resource {}", request.url);
-    }
-    fn is_noop(&self) -> bool {
-        true
-    }
-}
-
-struct Input {
-    pending: Vec<u8>,
-}
-
-impl Input {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-        }
-    }
-
-    fn probe_cell_pixels(&mut self) -> Option<(u16, u16)> {
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(b"\x1b[16t");
-        let _ = stdout.flush();
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            let bytes = self.read_bytes(50);
-            if bytes.is_empty() {
-                continue;
-            }
-            self.pending.extend_from_slice(&bytes);
-            let (rest, parsed) = parse_state(&self.pending, true);
-            self.pending = rest;
-            if parsed.cell.is_some() {
-                return parsed.cell;
-            }
-        }
-        None
-    }
-
-    fn next_actions(&mut self, timeout_ms: i32) -> Vec<Action> {
-        let wait = if self.pending.is_empty() {
-            timeout_ms
-        } else {
-            0
-        };
-        let bytes = self.read_bytes(wait);
-        self.pending.extend_from_slice(&bytes);
-        let (rest, parsed) = parse_state(&self.pending, false);
-        self.pending = rest;
-        parsed.actions
-    }
-
-    fn resized(&self, geo: &mut Geometry, (cols, rows): (u16, u16)) -> bool {
-        if cols == geo.cols && rows == geo.rows {
-            return false;
-        }
-        *geo = Geometry::from_parts(cols, rows, geo.cell_w, geo.cell_h);
-        true
-    }
-
-    fn read_bytes(&mut self, timeout_ms: i32) -> Vec<u8> {
-        let mut fds = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
-        if ready <= 0 {
-            return Vec::new();
-        }
-        let mut buf = [0u8; 512];
-        match std::io::stdin().read(&mut buf) {
-            Ok(n) => buf[..n].to_vec(),
-            Err(_) => Vec::new(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Parsed {
-    actions: Vec<Action>,
-    cell: Option<(u16, u16)>,
-}
-
-enum Action {
-    Quit,
-    Scroll(f64),
-    FocusNext,
-    FocusPrev,
-    Activate,
-    Home,
-    End,
-    Anchor(String),
-    Toggle(String),
-}
-
-/// Parse as many complete input sequences as possible. Returns unparsed tail.
-fn parse_state(bytes: &[u8], probe_only: bool) -> (Vec<u8>, Parsed) {
-    let mut parsed = Parsed::default();
-    let mut i = 0;
-    let mut tail_start = bytes.len();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x1b {
-            if i + 1 >= bytes.len() {
-                tail_start = i;
-                break;
-            }
-            if bytes[i + 1] == b'[' {
-                let start = i + 2;
-                let mut end = None;
-                let mut j = start;
-                while j < bytes.len() {
-                    if (0x40..=0x7e).contains(&bytes[j]) {
-                        end = Some(j);
-                        break;
-                    }
-                    j += 1;
-                }
-                let Some(end) = end else {
-                    tail_start = i;
-                    break;
-                };
-                let params = &bytes[start..end];
-                let fin = bytes[end];
-                match (params, fin) {
-                    (_, b't') if params.first() == Some(&b'6') => {
-                        let parts: Vec<&[u8]> = params.split(|b| *b == b';').collect();
-                        if parts.len() == 3
-                            && let (Ok(h), Ok(w)) = (
-                                std::str::from_utf8(parts[1]).unwrap_or("").parse::<u16>(),
-                                std::str::from_utf8(parts[2]).unwrap_or("").parse::<u16>(),
-                            )
-                            && w > 0
-                            && h > 0
-                        {
-                            parsed.cell = Some((w, h));
-                        }
-                    }
-                    (_, b'Z') => parsed.actions.push(Action::FocusPrev),
-                    (_, b'A') => parsed.actions.push(Action::Scroll(-40.0)),
-                    (_, b'B') => parsed.actions.push(Action::Scroll(40.0)),
-                    (params, b'~') => match params {
-                        b"5" => parsed.actions.push(Action::Scroll(-400.0)),
-                        b"6" => parsed.actions.push(Action::Scroll(400.0)),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                i = end + 1;
-                continue;
-            }
-            if bytes[i + 1] == b'O' {
-                if i + 2 >= bytes.len() {
-                    tail_start = i;
-                    break;
-                }
-                match bytes[i + 2] {
-                    b'A' => parsed.actions.push(Action::Scroll(-40.0)),
-                    b'B' => parsed.actions.push(Action::Scroll(40.0)),
-                    _ => {}
-                }
-                i += 3;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if !probe_only {
-            match b {
-                b'q' | 0x03 => parsed.actions.push(Action::Quit),
-                b'\t' => parsed.actions.push(Action::FocusNext),
-                b'\r' | b'\n' => parsed.actions.push(Action::Activate),
-                b'j' => parsed.actions.push(Action::Scroll(40.0)),
-                b'k' => parsed.actions.push(Action::Scroll(-40.0)),
-                b' ' => parsed.actions.push(Action::Scroll(400.0)),
-                b'g' => parsed.actions.push(Action::Home),
-                b'G' => parsed.actions.push(Action::End),
-                b'1'..=b'9' => {
-                    parsed
-                        .actions
-                        .push(Action::Anchor(format!("#{}", (b - b'0'))));
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    (bytes[tail_start..].to_vec(), parsed)
-}
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Metrics {
@@ -922,22 +892,24 @@ impl Metrics {
     fn new() -> Self {
         Self::default()
     }
+
     fn push(&mut self, key: &str, value: &str) {
         self.lines.push((key.to_string(), value.to_string()));
     }
+
     fn write(&self, path: Option<&str>) -> Result<(), String> {
         let Some(path) = path else { return Ok(()) };
         let body: String = self
             .lines
             .iter()
-            .map(|(k, v)| format!("{k}={v}\n"))
+            .map(|(key, value)| format!("{key}={value}\n"))
             .collect();
-        std::fs::write(path, body).map_err(|e| format!("cannot write {path}: {e}"))
+        std::fs::write(path, body).map_err(|err| format!("cannot write {path}: {err}"))
     }
 }
 
-fn format_ms(d: Duration) -> String {
-    format!("{:.1}", d.as_secs_f64() * 1000.0)
+fn format_ms(duration: Duration) -> String {
+    format!("{:.1}", duration.as_secs_f64() * 1000.0)
 }
 
 fn note_rss(metrics: &mut Metrics) {
@@ -957,34 +929,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kitty_frame_sets_placement_and_chunks() {
-        let png = vec![0u8; 9000];
-        let frame = kitty_frame(&png, 46, 16);
-        let text = String::from_utf8_lossy(&frame);
-        assert!(text.starts_with("\x1b[H\x1b_Ga=T,f=100,i="));
-        assert!(text.contains(",c=46,r=16,m=1;"));
-        assert!(text.contains("\x1b_Gm=0;"));
-        assert!(text.ends_with("\x1b\\"));
+    fn parses_navigation_and_search_keys() {
+        let keys = parse_keys(b"\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[Z\t\r/abc\x7f\x1b");
+        assert_eq!(
+            keys,
+            vec![
+                Key::Up,
+                Key::Down,
+                Key::PageUp,
+                Key::PageDown,
+                Key::BackTab,
+                Key::Tab,
+                Key::Enter,
+                Key::Char('/'),
+                Key::Char('a'),
+                Key::Char('b'),
+                Key::Char('c'),
+                Key::Backspace,
+                Key::Escape,
+            ]
+        );
     }
 
     #[test]
-    fn parses_cell_size_reply_without_losing_keys() {
-        let bytes = b"\x1b[6;34;17t\x1b[Zj";
-        let (rest, parsed) = parse_state(bytes, false);
-        assert_eq!(parsed.cell, Some((17, 34)));
-        assert_eq!(parsed.actions.len(), 2);
-        assert!(rest.is_empty());
+    fn rejects_url_shaped_inputs() {
+        assert!(looks_like_url("https://example.invalid/report.html"));
+        assert!(looks_like_url("file:///tmp/report.html"));
+        assert!(looks_like_url("data:text/html,<p>x</p>"));
+        assert!(!looks_like_url("report.html"));
+        assert!(!looks_like_url("-"));
     }
 
     #[test]
-    fn inline_document_with_external_asset_still_renders() {
-        let html = r##"<html><body style="background:#000;color:#fff">
-            <img src="https://example.invalid/x.png" alt="blocked">
-            <a href="#target">jump</a><div id="target">target</div>
-            <details><summary>one</summary><p>body</p></details>
-        </body></html>"##;
-        let mut doc = load(html, 400, 300, 1.0).expect("load");
-        let png = render(&mut doc, 400, 300, 1.0).expect("render");
-        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+    fn viewport_budget_is_enforced() {
+        assert!(check_viewport(840, 1800).is_ok());
+        assert!(check_viewport(0, 10).is_err());
+        assert!(check_viewport(4000, 4000).is_err());
     }
 }

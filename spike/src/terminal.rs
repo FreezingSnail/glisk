@@ -501,6 +501,18 @@ fn fstat(fd: RawFd) -> Option<libc::stat> {
     }
 }
 
+fn tty_name(fd: RawFd) -> Option<String> {
+    let mut buffer = [0i8; 256];
+    // SAFETY: buffer is writable for its full length.
+    let rc = unsafe { libc::ttyname_r(fd, buffer.as_mut_ptr(), buffer.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: ttyname_r wrote a NUL-terminated string in buffer.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) };
+    Some(cstr.to_string_lossy().into_owned())
+}
+
 pub fn terminal_size(fd: RawFd) -> io::Result<(u16, u16)> {
     // SAFETY: winsize is plain data and TIOCGWINSZ writes it on success.
     unsafe {
@@ -1093,14 +1105,20 @@ impl TerminalOwner {
         let (input_fd, input_file) = if is_tty(stdin_fd) && same_tty(stdin_fd, output_fd) {
             (stdin_fd, None)
         } else {
+            // `/dev/tty` is a pseudo-device on macOS: `fstat` reports the
+            // device itself, and `poll` on it can return POLLNVAL. Open the
+            // device name behind the stdout terminal instead. The shared
+            // cell/graphics probe below then confirms that reads and writes
+            // reach the same terminal.
+            let name = tty_name(output_fd).ok_or(TerminalError::NotSameTerminal)?;
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open("/dev/tty")
+                .open(&name)
                 .map_err(|err| TerminalError::TtyOpen(err.to_string()))?;
             let fd = file.as_raw_fd();
-            if !same_tty(fd, output_fd) {
-                return Err(TerminalError::NotSameTerminal);
+            if !is_tty(fd) {
+                return Err(TerminalError::NotATerminal("controlling terminal"));
             }
             (fd, Some(file))
         };
@@ -1131,7 +1149,10 @@ impl TerminalOwner {
         if !is_tty(output_fd) {
             return Err(TerminalError::NotATerminal("output"));
         }
-        if !same_tty(input_fd, output_fd) {
+        // When input was opened from the stdout terminal device, the shared
+        // probe below is the authoritative same-terminal check. `from_fds`
+        // callers still get the strict device comparison.
+        if input_file.is_none() && !same_tty(input_fd, output_fd) {
             return Err(TerminalError::NotSameTerminal);
         }
 

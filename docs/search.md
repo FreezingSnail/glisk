@@ -11,10 +11,10 @@ the previous query and position. Matches inside closed disclosures are found
 because extraction includes their bodies, and revealing a match uses the shared
 `Navigation::reveal` hook, which opens hiding disclosures and aligns the block.
 
-The module is **not wired into `spike/src/main.rs` yet**. The wiring bead adds
-`mod search;` next to the existing modules and maps `/`, Enter, Escape, `n`, and
-`N` to the [`Search`] methods. Until then the integration test includes the
-text, navigation, viewport, and search modules with `#[path = "..."]`.
+The module is wired into the pager by bead `glisk-2hp.8`: `spike/src/main.rs`
+maps `/`, Enter, Escape, `n`, and `N` to the [`Search`] methods. The integration
+test still includes the text, navigation, viewport, and search modules with
+`#[path = "..."]`.
 
 ## Contract
 

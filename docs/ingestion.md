@@ -70,25 +70,14 @@ Diagnostics: `ResourcePolicy::denials()`, `denial_reasons()`,
 `admitted_images()`, and `admitted_image_pixels()` expose policy outcomes
 without coupling rendering to terminal escape production.
 
-## Wiring the next bead
+## Wiring in the CLI
 
-1. Add `mod document;` beside the other module declarations in
-   `spike/src/main.rs`.
-2. Replace the `std::fs::read_to_string` call and the `load()` helper with:
-
-   ```rust
-   let ingested = if args.file == "-" {
-       document::ingest_stdin(viewport, document::Limits::default())
-   } else {
-       document::ingest_file(&args.file, viewport, document::Limits::default())
-   };
-   ```
-
-   The viewport is chosen after TTY geometry is known. Keep the read and policy
-   check before alternate-screen entry.
-3. Use `ingested.document` for paint, key handling, snapshots, and text walks;
-   keep `ingested.policy` for the blocked-resource diagnostics line.
-4. Delete the per-module `DenyNetProvider`; the shared provider replaces it.
+`spike/src/main.rs` declares `mod document;` and sends file and `-` sources
+through `document::ingest_file` / `ingest_stdin` with the same `Limits::default()`
+before mode selection or alternate-screen entry. The live path re-lays out the
+returned document at terminal geometry; `--text` and automatic fallback use the
+document for `text::extract_plain_text`. The per-module deny-all provider from
+the renderer spike has been removed.
 
 ## Verification
 

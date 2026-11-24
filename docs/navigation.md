@@ -11,10 +11,10 @@ the focused disclosure, and reports an unknown fragment without changing the
 view. Focus and disclosure state stay on the live Blitz document, so a viewport
 resize and reflow keep both useful.
 
-The module is **not wired into `spike/src/main.rs` yet**. The wiring bead adds
-`mod navigation;` next to `mod viewport;` and maps Tab/Shift+Tab/Enter to the
-[`Navigation`] methods. Until then the integration test includes both modules
-with `#[path = "../src/viewport.rs"]` and `#[path = "../src/navigation.rs"]`.
+The module is wired into the pager by bead `glisk-2hp.8`: `spike/src/main.rs`
+maps Tab/Shift+Tab/Enter to the [`Navigation`] methods. The integration test
+still includes both modules with `#[path = "../src/viewport.rs"]` and
+`#[path = "../src/navigation.rs"]`.
 
 ## Contract
 

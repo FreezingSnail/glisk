@@ -11,10 +11,9 @@ disclosures because it never rebuilds the DOM. Geometry is explicit: physical
 pixels, device scale, and the derived CSS viewport are passed in, so the layout
 is testable without a TTY.
 
-The module is **not wired into `spike/src/main.rs` yet**. The wiring bead adds
-`mod viewport;` next to the other modules and replaces the spike's inline
-`load`/`render`/scroll handling. Until then the integration test includes the
-module with `#[path = "../src/viewport.rs"]`.
+The module is wired into `spike/src/main.rs` by bead `glisk-2hp.8`. The live
+path replaces the spike's inline load/render/scroll handling. The integration
+test still includes the module with `#[path = "../src/viewport.rs"]`.
 
 ## Contract
 
