@@ -13,9 +13,10 @@ and graphics share the same live `BaseDocument`.
 
 | Invocation | Result |
 |---|---|
-| `glisk report.html` | Live pager when `stdout` is a TTY and either the direct Kitty/geometry probe or the tmux pane/client check succeeds. |
-| `glisk -` | Same, reading the document bytes from stdin. Keyboard input comes from the terminal behind `stdout`; a pipe on stdin is fine. |
-| `glisk report.html --text` | Plain UTF-8 text from `text::extract_plain_text`; no terminal session, tmux query, or graphics. |
+| `glisk report.html` | Live pager when `stdout` is a TTY and either the direct Kitty/geometry probe or the tmux pane/client check succeeds. The named file is watched and redisplayed when it changes. |
+| `glisk report.html --no-watch` | Same live pager, but this session holds the revision that was opened and never reloads it. |
+| `glisk -` | Same, reading the document bytes from stdin. Keyboard input comes from the terminal behind `stdout`; a pipe on stdin is fine. Stdin is never watched. |
+| `glisk report.html --text` | Plain UTF-8 text from `text::extract_plain_text`; no terminal session, tmux query, graphics, or watch. |
 | Redirected `stdout` | Plain text immediately, without tmux detection or graphics. |
 | Missing TTY, graphics rejection, missing geometry, probe timeout, tmux failure | Plain text; one actionable reason is printed on stderr. |
 | Closed downstream pipe on plain output | Quiet success, exit 0. |
@@ -24,6 +25,33 @@ Diagnostics go to stderr. Plain content and terminal graphics go to stdout.
 Usage errors (including no input) exit 2 through `clap`; input, resource-limit,
 render, and I/O failures exit 1. Normal quit, Ctrl+C, and a closed downstream
 pipe exit 0.
+
+## Following a local report
+
+An interactive pager session for a named local `.htm`/`.html` file watches
+that one path by default. Save the file from an editor, or let an agent
+regenerate it with an atomic `rename`, and the open report redraws without a
+restart. The same behavior applies to direct Ghostty and to the supported tmux
+pane; no tmux option changes.
+
+- Checks are throttled and debounced inside the existing input loop, so bursts
+  coalesce and unchanged bytes do not repaint.
+- Only the opened path is observed. There is no directory discovery and no
+  secondary document read.
+- A missing, unreadable, oversized, or unrenderable replacement keeps the last
+  good report and shows a concise reload error in the status row. A later valid
+  save recovers automatically.
+- Reading position follows a surviving `id` on the visible block or its
+  containing section, then a surviving preceding heading `id`, then clamps the
+  previous scroll offset. Bottom stays bottom. Open disclosure `id`s, focused
+  eligible controls, and the search query are mapped onto the new document;
+  matches are rebuilt without jumping away from the restored section.
+- `--no-watch` opens a snapshot session that never reloads.
+- Stdin, `--text`, redirected stdout, graphics fallback, and the hidden
+  diagnostic modes never start a watcher and continue to exit normally.
+
+Author stable, unique ids on sections, headings, and disclosures so reloads can
+keep the reader in place. See [`authoring.md`](authoring.md#reload-stable-ids).
 
 ## tmux setup
 

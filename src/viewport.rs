@@ -289,6 +289,50 @@ pub struct Anchor {
     pub at_bottom: bool,
 }
 
+/// Reading position expressed with author-supplied HTML ids.
+///
+/// Reloading the file replaces the document, so DOM-local [`NodeId`]s from the
+/// previous revision must never be reused. This anchor records the nearest
+/// surviving `id` on the visible block or its containing section, a preceding
+/// heading id as a fallback, and the previous scroll offset for the final
+/// deterministic clamp.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorAnchor {
+    /// Nearest author `id` on the visible block or one of its ancestors.
+    pub block_id: Option<String>,
+    /// Signed offset from that id's document top to the viewport top.
+    pub block_offset: f64,
+    /// Nearest preceding heading block's author id, if any.
+    pub heading_id: Option<String>,
+    /// Scroll offset before the reload, used when no id survives.
+    pub scroll_y: f64,
+    /// The reader was at the end; keep the new document at its end.
+    pub at_bottom: bool,
+}
+
+/// Result of restoring an [`AuthorAnchor`] on a fresh revision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AuthorRestoreInfo {
+    pub scroll_y: f64,
+    pub anchored: bool,
+    pub used_heading_fallback: bool,
+}
+
+/// Nearest author-supplied id on `node` or one of its ancestors.
+pub fn author_id(document: &BaseDocument, node: NodeId) -> Option<String> {
+    document.node_chain(node).into_iter().find_map(|id| {
+        let node = document.get_node(id)?;
+        let value = node.attr(blitz_dom::local_name!("id"))?;
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// The element's own non-empty `id` attribute, without walking ancestors.
+pub fn own_id(node: &blitz_dom::Node) -> Option<&str> {
+    node.attr(blitz_dom::local_name!("id"))
+        .filter(|value| !value.is_empty())
+}
+
 /// Result of applying a valid resize.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResizeInfo {
@@ -502,6 +546,93 @@ impl Viewport {
             offset: self.scroll_y - selected.top,
             at_bottom: max_scroll > 0.0 && self.scroll_y >= max_scroll - 0.5,
         })
+    }
+
+    /// Capture the reading position using author ids for a document reload.
+    pub fn capture_author_anchor(&mut self) -> Option<AuthorAnchor> {
+        let geometry = self.geometry?;
+        self.resolve();
+        let blocks = collect_blocks(&self.document);
+        let selected = self.select_visible_block(&blocks)?;
+        let index = blocks
+            .iter()
+            .position(|block| block.node == selected.node)?;
+        let block_id = author_id(&self.document, selected.node);
+        let block_offset = block_id
+            .as_deref()
+            .and_then(|id| self.document.get_element_by_id(id))
+            .and_then(|node| document_top(&self.document, node))
+            .map_or(selected.offset, |top| self.scroll_y - top);
+        let heading_id = blocks[..index]
+            .iter()
+            .rev()
+            .find(|block| block.heading)
+            .and_then(|block| author_id(&self.document, block.node));
+        let max_scroll = self.max_scroll_for(geometry);
+        Some(AuthorAnchor {
+            block_id,
+            block_offset,
+            heading_id,
+            scroll_y: self.scroll_y,
+            at_bottom: max_scroll > 0.0 && self.scroll_y >= max_scroll - 0.5,
+        })
+    }
+
+    /// Restore an author-id anchor on this (fresh) document.
+    ///
+    /// The visible block id wins, then the preceding heading id, then the
+    /// previous numeric offset. An at-bottom anchor always wins and returns to
+    /// the new document's end.
+    pub fn restore_author_anchor(&mut self, anchor: &AuthorAnchor) -> AuthorRestoreInfo {
+        let Some(geometry) = self.geometry else {
+            return AuthorRestoreInfo {
+                scroll_y: self.scroll_y,
+                anchored: false,
+                used_heading_fallback: false,
+            };
+        };
+        self.resolve();
+        let max_scroll = self.max_scroll_for(geometry);
+        let mut target = self.scroll_y;
+        let mut anchored = false;
+        let mut used_heading_fallback = false;
+
+        if anchor.at_bottom {
+            target = max_scroll;
+            anchored = true;
+        } else {
+            if let Some(id) = anchor.block_id.as_deref()
+                && let Some(node) = self.document.get_element_by_id(id)
+                && let Some(top) = document_top(&self.document, node)
+            {
+                target = top + anchor.block_offset;
+                anchored = true;
+            }
+            if !anchored
+                && let Some(id) = anchor.heading_id.as_deref()
+                && let Some(node) = self.document.get_element_by_id(id)
+                && let Some(top) = document_top(&self.document, node)
+            {
+                target = top;
+                anchored = true;
+                used_heading_fallback = true;
+            }
+            if !anchored {
+                target = anchor.scroll_y;
+            }
+        }
+
+        let target = if target.is_finite() {
+            target.clamp(0.0, max_scroll)
+        } else {
+            0.0
+        };
+        self.set_scroll(target);
+        AuthorRestoreInfo {
+            scroll_y: self.scroll_y,
+            anchored,
+            used_heading_fallback,
+        }
     }
 
     /// The top visible content block for the current layout.

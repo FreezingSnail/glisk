@@ -61,6 +61,31 @@ fn viewport(width: u32, height: u32) -> Viewport {
     Viewport::new(document(width, height), width, height, 1.0)
 }
 
+fn document_from(html: &str, width: u32, height: u32) -> BaseDocument {
+    let config = DocumentConfig {
+        viewport: Some(BlitzViewport::new(width, height, 1.0, ColorScheme::Dark)),
+        ..Default::default()
+    };
+    let mut document = HtmlDocument::from_html(html, config).into_inner();
+    document.resolve(0.0);
+    document
+}
+
+fn node_top(viewport: &Viewport, id: &str) -> f64 {
+    let node = viewport
+        .document()
+        .get_element_by_id(id)
+        .unwrap_or_else(|| panic!("fixture must contain #{id}"));
+    f64::from(
+        viewport
+            .document()
+            .get_node(node)
+            .expect("node")
+            .absolute_position(0.0, 0.0)
+            .y,
+    )
+}
+
 fn painted(viewport: &mut Viewport) -> viewport::Frame {
     match viewport.paint().expect("paint succeeds") {
         PaintOutcome::Frame(frame) => frame,
@@ -241,6 +266,88 @@ fn missing_block_falls_back_to_the_preceding_heading() {
         "scroll {} did not land on heading top {heading_top}",
         viewport.scroll_y()
     );
+}
+
+#[test]
+fn author_anchor_keeps_a_surviving_block_id_across_a_reload() {
+    let mut first = viewport(220, 130);
+    let old_top = node_top(&first, "p12");
+    assert!(first.scroll_to(old_top));
+    let anchor = first.capture_author_anchor().expect("author anchor");
+    assert_eq!(anchor.block_id.as_deref(), Some("p12"));
+    assert!(approx(anchor.block_offset, 0.0, 0.6));
+
+    let changed = fixture_html().replace(
+        "<p id=\"p11\">",
+        "<p id=\"inserted\">Inserted words above the anchor.</p><p id=\"p11\">",
+    );
+    let mut second = Viewport::new(document_from(&changed, 220, 130), 220, 130, 1.0);
+    let info = second.restore_author_anchor(&anchor);
+    assert!(info.anchored && !info.used_heading_fallback);
+    let new_top = node_top(&second, "p12");
+    assert!(
+        new_top > old_top,
+        "fixture must move the anchored block down"
+    );
+    assert!(
+        approx(second.scroll_y(), new_top, 0.6),
+        "scroll {} did not follow #p12 to {new_top}",
+        second.scroll_y()
+    );
+}
+
+#[test]
+fn author_anchor_falls_back_to_a_preceding_heading_id() {
+    let mut first = viewport(220, 130);
+    let target = node_top(&first, "p12");
+    assert!(first.scroll_to(target));
+    let anchor = first.capture_author_anchor().expect("author anchor");
+
+    let changed = fixture_html().replace("<p id=\"p12\">", "<p>");
+    let mut second = Viewport::new(document_from(&changed, 220, 130), 220, 130, 1.0);
+    let info = second.restore_author_anchor(&anchor);
+    assert!(info.anchored && info.used_heading_fallback);
+    assert!(
+        approx(second.scroll_y(), node_top(&second, "middle-heading"), 0.6),
+        "scroll {} did not fall back to the heading",
+        second.scroll_y()
+    );
+}
+
+#[test]
+fn author_anchor_clamps_when_every_id_is_lost() {
+    let mut first = viewport(220, 130);
+    let target = node_top(&first, "p12");
+    assert!(first.scroll_to(target));
+    let anchor = first.capture_author_anchor().expect("author anchor");
+    assert!(anchor.block_id.is_some());
+    assert!(anchor.heading_id.is_some());
+
+    let changed = fixture_html()
+        .replace("<p id=\"p12\">", "<p>")
+        .replace("<h2 id=\"middle-heading\">", "<h2>");
+    let mut second = Viewport::new(document_from(&changed, 220, 130), 220, 130, 1.0);
+    let info = second.restore_author_anchor(&anchor);
+    assert!(!info.anchored);
+    assert!(!info.used_heading_fallback);
+    assert!(approx(second.scroll_y(), anchor.scroll_y, 0.01));
+}
+
+#[test]
+fn author_anchor_keeps_the_bottom_of_a_grown_revision() {
+    let mut first = viewport(220, 130);
+    assert!(first.scroll_end());
+    let anchor = first.capture_author_anchor().expect("author anchor");
+    assert!(anchor.at_bottom);
+
+    let changed = fixture_html().replace(
+        "</body>",
+        "<p>Additional trailing words after the old end.</p></body>",
+    );
+    let mut second = Viewport::new(document_from(&changed, 220, 130), 220, 130, 1.0);
+    let info = second.restore_author_anchor(&anchor);
+    assert!(info.anchored);
+    assert!(approx(second.scroll_y(), second.max_scroll(), 0.01));
 }
 
 #[test]

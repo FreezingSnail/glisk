@@ -109,6 +109,28 @@ diagnostic snapshots use the initial animation state.
 </html>
 ```
 
+## Reload-stable ids
+
+An interactive pager session for a named local file reloads it when the file is
+saved or atomically replaced. Give important sections, headings, and
+disclosures stable, unique `id` values so the reader can stay on the same
+content after the regenerated report is laid out again:
+
+```html
+<section id="costs">
+  <h2 id="costs-heading">Costs</h2>
+  <details id="costs-method"><summary>Method</summary>...</details>
+</section>
+```
+
+On reload, Glisk restores the position from a surviving `id` on the visible
+block or its containing section, then from a surviving preceding heading `id`,
+then by clamping the previous scroll offset. Bottom stays bottom. Open
+disclosure `id`s and eligible focus targets are restored, and the search query
+is rebuilt against the new document. When an id disappears, recovery is
+deterministic but the reader may move to the nearest surviving anchor. Use
+`--no-watch` when a snapshot session should ignore later saves.
+
 ## Reader contract
 
 | Action | Result |
@@ -120,6 +142,7 @@ diagnostic snapshots use the initial animation state.
 | `p` | Pause or resume animations. |
 | `/`, `n`, `N` | Search all semantic text and cycle matches; a match inside a closed disclosure opens it. |
 | Resize | Reflow at the new width and keep the reading position, focus, and open disclosures. |
+| File save / atomic replace | Reload the named local report, keep the anchored section, disclosures, focus, and search query, and replace the frame only when the new revision can paint. |
 | `q`, Ctrl+C | Delete the image and restore the terminal. |
 
 Give every important section a unique `id`, label every link with its

@@ -832,6 +832,115 @@ fn glisk_uses_the_tmux_placeholder_path_end_to_end() {
     let _ = client.wait();
 }
 
+fn tmux_watch_html(marker: &str) -> String {
+    format!(
+        "<!doctype html><html><head><style>
+         html, body {{ margin: 0; background: #fff; color: #000; }}
+         body {{ font: 16px/24px monospace; }}
+         section {{ min-height: 240px; }}
+         </style></head><body>
+         <h1 id=\"tmux-watch-top\">Watched report</h1>
+         <section id=\"tmux-watch-first\"><p>{marker}</p></section>
+         <section id=\"tmux-watch-last\"><p>Closing section.</p></section>
+         </body></html>"
+    )
+}
+
+#[test]
+fn tmux_pane_follows_local_report_reloads() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = TmuxServer::start("on");
+    server.run(&["set-option", "status", "off"]);
+    let pty = Pty::open(80, 24);
+    let capture = Capture::start(&pty);
+    let mut client = server.attach(&pty);
+    let pane = server.pane_id();
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let report = env::temp_dir().join(format!("glisk-tmux-watch-{}-{id}.html", std::process::id()));
+    let replacement = env::temp_dir().join(format!(
+        "glisk-tmux-watch-{}-{id}.replacement",
+        std::process::id()
+    ));
+    std::fs::write(&report, tmux_watch_html("alpha revision")).expect("write watched report");
+    let metrics = env::temp_dir().join(format!(
+        "glisk-tmux-watch-metrics-{}-{id}.txt",
+        std::process::id()
+    ));
+    let binary = env!("CARGO_BIN_EXE_glisk");
+    let script = format!(
+        "'{binary}' '{}' --metrics '{}'; exec sh",
+        report.display(),
+        metrics.display()
+    );
+    server.run(&["respawn-pane", "-k", "-t", &pane, "sh", "-c", &script]);
+    assert!(
+        capture.wait_for(Duration::from_secs(30), |bytes| {
+            contains(bytes, b"glisk |") && contains(bytes, b"\x1b_Ga=T")
+        }),
+        "the tmux pager never painted its first watched frame: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+
+    let first = capture.snapshot().len();
+    std::fs::write(&report, tmux_watch_html("beta revision")).expect("rewrite report");
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[first..], b"\x1b_Ga=")
+        }),
+        "a normal save must reload in the tmux pane"
+    );
+
+    let second = capture.snapshot().len();
+    std::fs::write(&replacement, tmux_watch_html("gamma revision"))
+        .expect("write atomic replacement");
+    std::fs::rename(&replacement, &report).expect("atomic replacement");
+    assert!(
+        capture.wait_for(Duration::from_secs(10), |bytes| {
+            contains(&bytes[second..], b"\x1b_Ga=")
+        }),
+        "an atomic replacement must reload in the tmux pane"
+    );
+
+    server.run(&["send-keys", "-t", &pane, "q"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let screen = server.run(&["capture-pane", "-p", "-t", &pane]);
+        if screen.contains("sh-3.2$") && !screen.contains("glisk |") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !metrics.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        metrics_value(&metrics, "watch").as_deref(),
+        Some("on"),
+        "tmux live sessions must watch by default"
+    );
+    let reloads = metrics_value(&metrics, "watch_reloads")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    assert!(
+        reloads >= 2,
+        "tmux pane must reload both saves, saw {reloads}"
+    );
+    assert_eq!(
+        metrics_value(&metrics, "placement").as_deref(),
+        Some("tmux")
+    );
+
+    let _ = std::fs::remove_file(&metrics);
+    let _ = std::fs::remove_file(&report);
+    let _ = std::fs::remove_file(&replacement);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 #[test]
 fn returning_to_a_visible_pane_reuploads_the_image_and_keeps_the_grid() {
     if !tmux_available() {

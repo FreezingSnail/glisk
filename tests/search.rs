@@ -69,6 +69,16 @@ fn viewport(width: u32, height: u32) -> Viewport {
     Viewport::new(document(width, height), width, height, 1.0)
 }
 
+fn document_from(html: &str, width: u32, height: u32) -> BaseDocument {
+    let config = DocumentConfig {
+        viewport: Some(BlitzViewport::new(width, height, 1.0, ColorScheme::Dark)),
+        ..Default::default()
+    };
+    let mut document = HtmlDocument::from_html(html, config).into_inner();
+    document.resolve(0.0);
+    document
+}
+
 fn element(viewport: &Viewport, id: &str) -> NodeId {
     viewport
         .document()
@@ -412,5 +422,72 @@ fn query_matches_and_position_survive_viewport_resize() {
     assert_eq!(
         search.next(&mut viewport, &mut navigation).unwrap().node,
         element(&viewport, "alpha")
+    );
+}
+
+#[test]
+fn reload_remap_rebuilds_matches_without_moving_the_reader() {
+    let mut viewport = viewport(220, 130);
+    let mut navigation = Navigation::new();
+    let mut search = Search::new();
+
+    search.begin();
+    for ch in "wrapmark".chars() {
+        search.push_char(ch);
+    }
+    commit(&mut search, &mut viewport, &mut navigation);
+    assert_eq!(
+        search.next(&mut viewport, &mut navigation).unwrap().node,
+        element(&viewport, "beta")
+    );
+    let previous_author = search
+        .current_match()
+        .and_then(|node| viewport::author_id(viewport.document(), node));
+    assert_eq!(previous_author.as_deref(), Some("beta"));
+
+    let changed = fixture_html().replace(
+        "<p id=\"alpha\">",
+        "<p id=\"preface\">A new wrapmark preface mentions freshneedle.</p><p id=\"alpha\">",
+    );
+    let mut reloaded = Viewport::new(document_from(&changed, 220, 130), 220, 130, 1.0);
+    reloaded.scroll_to(120.0);
+    let scroll = reloaded.scroll_y();
+    let text = extract(reloaded.document());
+
+    search.remap(&text, &mut reloaded, previous_author);
+    assert_eq!(
+        reloaded.scroll_y(),
+        scroll,
+        "rebuilding matches must not jump the reader"
+    );
+    assert_eq!(
+        search.current_match(),
+        reloaded.document().get_element_by_id("beta")
+    );
+    assert_eq!(
+        search.status(),
+        &SearchStatus::Match {
+            query: "wrapmark".to_string(),
+            current: 3,
+            total: 4,
+        }
+    );
+
+    let mut fresh = Search::new();
+    fresh.begin();
+    for ch in "freshneedle".chars() {
+        fresh.push_char(ch);
+    }
+    assert_eq!(
+        commit(&mut fresh, &mut viewport, &mut navigation),
+        SearchStatus::NoMatches {
+            query: "freshneedle".to_string()
+        }
+    );
+    fresh.remap(&text, &mut reloaded, None);
+    assert_eq!(fresh.match_count(), 1);
+    assert_eq!(
+        fresh.current_match(),
+        reloaded.document().get_element_by_id("preface")
     );
 }

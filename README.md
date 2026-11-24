@@ -18,6 +18,13 @@ Scroll with the wheel or trackpad, and left-click a visible fragment link or
 disclosure summary to follow or toggle it. The full keymap is in
 [`docs/cli.md`](docs/cli.md).
 
+A named local report is followed by default: keep Glisk open in one pane and
+save or atomically regenerate the HTML in another, and the view reloads without
+a restart. Reader position follows stable element `id`s, open disclosures and
+search survive, and a failed replacement keeps the last good report with an
+actionable status. Pass `--no-watch` for a snapshot session. Stdin, `--text`,
+redirected output, and graphics fallback never watch.
+
 Build and package the macOS bundle with the checked-in pinned lockfile:
 
 ```sh
@@ -63,5 +70,6 @@ bounded `data:image/png` assets.
 - [`docs/cli.md`](docs/cli.md) — modes, keymap, tmux setup, diagnostics, and tests.
 - [`docs/terminal-session.md`](docs/terminal-session.md) — terminal owner, direct Kitty path, and tmux placement.
 - [`docs/evidence/tmux-ghostty.md`](docs/evidence/tmux-ghostty.md) — live tmux protocol and Ghostty 1.4 evidence.
+- [`docs/evidence/watch-reload.md`](docs/evidence/watch-reload.md) — live reload, recovery, opt-out, and tmux workflow evidence.
 - [`docs/release.md`](docs/release.md) — macOS packaging, evidence, and unverified checks.
 - [`docs/renderer-spike.md`](docs/renderer-spike.md) — historical renderer measurements.

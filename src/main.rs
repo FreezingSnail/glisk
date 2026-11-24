@@ -15,14 +15,16 @@ mod terminal;
 mod text;
 mod tmux;
 mod viewport;
+mod watch;
 
 use std::{
     io::{self, Write},
+    path::Path,
     time::{Duration, Instant},
 };
 
 use anyrender_vello_cpu::VelloCpuScenePainter;
-use blitz_dom::{BaseDocument, ScrollBehavior, ScrollLogicalPosition};
+use blitz_dom::{BaseDocument, ScrollBehavior, ScrollLogicalPosition, local_name};
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 use clap::Parser;
 
@@ -30,7 +32,7 @@ use document::{IngestError, IngestedDocument, Limits};
 use navigation::Navigation;
 use search::Search;
 use terminal::{Geometry, TerminalConfig, TerminalError, TerminalOwner};
-use viewport::{PaintOutcome, ResizeOutcome, Viewport as DocViewport};
+use viewport::{AuthorAnchor, PaintOutcome, ResizeOutcome, ViewGeometry, Viewport as DocViewport};
 
 const MAX_RASTER_PIXELS: u64 = 8_388_608;
 const TEXT_VIEWPORT_WIDTH: u32 = 420;
@@ -51,6 +53,10 @@ struct Args {
     /// Open the live pager with animations paused.
     #[arg(long)]
     pause_animation: bool,
+
+    /// Open a named local report once; do not follow later file changes.
+    #[arg(long)]
+    no_watch: bool,
 
     /// Diagnostic: write one viewport PNG to this path.
     #[arg(long, hide = true)]
@@ -129,19 +135,48 @@ fn main() {
 fn run_cli(args: &Args, started: Instant) -> Result<(), String> {
     // Ingest with a deterministic text viewport first. The live path re-lays
     // out the same live document at terminal geometry after the owner opens.
-    let ingested = ingest_source(&args.input, text_viewport())?;
+    //
+    // A possible live file session captures the source bytes and metadata
+    // before ingestion, so the watcher can distinguish a real change from the
+    // revision already on screen (including a change between ingest and the
+    // first frame) and can skip a metadata-only touch with identical bytes.
+    let (ingested, baseline) =
+        if wants_watch(args) && !args.text && terminal::is_tty(libc::STDOUT_FILENO) {
+            let state = watch::path_state(Path::new(&args.input));
+            if matches!(state, watch::PathState::File(_)) {
+                let html = document::read_html_file(&args.input, &Limits::default())
+                    .map_err(|err| err.to_string())?;
+                let digest = watch::content_digest(html.as_bytes());
+                let ingested = document::open_document(&html, text_viewport(), Limits::default())
+                    .map_err(|err| err.to_string())?;
+                (ingested, Some(watch::Baseline { state, digest }))
+            } else {
+                (ingest_source(&args.input, text_viewport())?, None)
+            }
+        } else {
+            (ingest_source(&args.input, text_viewport())?, None)
+        };
 
     if args.text || !terminal::is_tty(libc::STDOUT_FILENO) {
         return write_plain_text(&ingested.document);
     }
 
     match TerminalOwner::open_with_config(TerminalConfig::default()) {
-        Ok(owner) => run_pager(args, ingested, owner, started),
+        Ok(owner) => run_pager(args, ingested, baseline, owner, started),
         Err(err) => {
             eprintln!("glisk: graphics unavailable: {err}; using plain text");
             write_plain_text(&ingested.document)
         }
     }
+}
+
+/// Watching is a live-pager feature for named local files only.
+fn wants_watch(args: &Args) -> bool {
+    !args.no_watch
+        && !args.once
+        && !args.scripted_actions
+        && args.input != "-"
+        && !looks_like_url(&args.input)
 }
 
 fn text_viewport() -> BlitzViewport {
@@ -199,6 +234,8 @@ struct Pager {
     animation_paused: bool,
     frames: u32,
     metrics: Metrics,
+    watcher: Option<watch::Watcher>,
+    watch_status: Option<String>,
 }
 
 impl Pager {
@@ -210,6 +247,8 @@ impl Pager {
             animation_paused: false,
             frames: 0,
             metrics: Metrics::new(),
+            watcher: None,
+            watch_status: None,
         }
     }
 
@@ -303,8 +342,13 @@ impl Pager {
         } else {
             ""
         };
+        let reload_status = self
+            .watch_status
+            .as_deref()
+            .map(|status| format!(" | {status}"))
+            .unwrap_or_default();
         format!(
-            "glisk | {percent:.0}%{animation_status} | {} | {} | Tab focus  Enter open  / search  j/k scroll  q quit",
+            "glisk{reload_status} | {percent:.0}%{animation_status} | {} | {} | Tab focus  Enter open  / search  j/k scroll  q quit",
             self.search.status(),
             self.navigation.status()
         )
@@ -391,6 +435,26 @@ impl Pager {
             if owner.take_repaint_request() {
                 self.metrics.count("tmux_repaints");
                 changed = true;
+            }
+
+            if let Some(state) = self.watcher.as_mut().and_then(|watcher| watcher.poll(now)) {
+                match self.reload(&args.input, &state) {
+                    Ok(reloaded) => {
+                        if self.watch_status.take().is_some() {
+                            changed = true;
+                        }
+                        changed |= reloaded;
+                    }
+                    Err(status) => {
+                        if let Some(watcher) = &mut self.watcher {
+                            watcher.reject(state);
+                        }
+                        if self.watch_status.as_deref() != Some(status.as_str()) {
+                            self.watch_status = Some(status);
+                            changed = true;
+                        }
+                    }
+                }
             }
 
             if changed
@@ -486,6 +550,77 @@ impl Pager {
         }
     }
 
+    /// Open one changed revision through the bounded offline path, map reader
+    /// state onto it, and swap only after it can paint. The previous report is
+    /// untouched on every failure.
+    fn reload(&mut self, path: &str, state: &watch::PathState) -> Result<bool, String> {
+        if !matches!(state, watch::PathState::File(_)) {
+            return Err(match state {
+                watch::PathState::Missing => {
+                    "reload: file missing (keeping previous report)".to_string()
+                }
+                watch::PathState::NotRegular => {
+                    "reload: not a regular file (keeping previous report)".to_string()
+                }
+                watch::PathState::Unreadable => {
+                    "reload: cannot read file (keeping previous report)".to_string()
+                }
+                watch::PathState::File(_) => unreachable!(),
+            });
+        }
+        let Some(geometry) = self.view.geometry() else {
+            return Err("reload: no viewport (keeping previous report)".to_string());
+        };
+        let html = document::read_html_file(path, &Limits::default())
+            .map_err(|err| reload_ingest_error(&err))?;
+        let digest = watch::content_digest(html.as_bytes());
+        if self
+            .watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.known_digest() == digest)
+        {
+            if let Some(watcher) = &mut self.watcher {
+                watcher.accept(state.clone(), digest);
+            }
+            self.metrics.count("watch_unchanged");
+            return Ok(false);
+        }
+
+        let reading = capture_reload_state(&mut self.view, &self.search);
+        let ingested =
+            document::open_document(&html, geometry_viewport(geometry), Limits::default())
+                .map_err(|err| reload_ingest_error(&err))?;
+        let (width, height) = geometry.physical_size();
+        let mut candidate = DocViewport::new(ingested.document, width, height, geometry.scale());
+        restore_open_details(&mut candidate, &reading.open_details);
+        restore_focus(&mut candidate, reading.focus.as_ref());
+        if let Some(anchor) = &reading.anchor {
+            candidate.restore_author_anchor(anchor);
+        }
+        let text = text::extract(candidate.document());
+        let mut staged_search = self.search.clone();
+        staged_search.remap(&text, &mut candidate, reading.match_author);
+        match candidate
+            .paint()
+            .map_err(|err| format!("reload: cannot render ({err}); keeping previous report"))?
+        {
+            PaintOutcome::Frame(_) => {}
+            PaintOutcome::Skipped(reason) => {
+                return Err(format!(
+                    "reload: cannot render ({reason}); keeping previous report"
+                ));
+            }
+        }
+
+        self.view = candidate;
+        self.search = staged_search;
+        if let Some(watcher) = &mut self.watcher {
+            watcher.accept(state.clone(), digest);
+        }
+        self.metrics.count("watch_reloads");
+        Ok(true)
+    }
+
     fn run_scripted_actions(
         &mut self,
         args: &Args,
@@ -534,15 +669,150 @@ impl Pager {
     }
 }
 
+/// Reader state captured from the displayed revision for a reload.
+struct ReloadState {
+    anchor: Option<AuthorAnchor>,
+    open_details: Vec<String>,
+    focus: Option<FocusPoint>,
+    match_author: Option<String>,
+}
+
+struct FocusPoint {
+    author: Option<String>,
+    index: Option<usize>,
+    kind: Option<navigation::ControlKind>,
+}
+
+fn capture_reload_state(view: &mut DocViewport, search: &Search) -> ReloadState {
+    view.resolve();
+    let anchor = view.capture_author_anchor();
+    let open_details = open_details_ids(view.document());
+    let controls = navigation::controls(view.document());
+    let focus = view
+        .document()
+        .get_focussed_node_id()
+        .map(|node| FocusPoint {
+            author: viewport::author_id(view.document(), node),
+            index: controls.iter().position(|control| control.node == node),
+            kind: controls
+                .iter()
+                .find(|control| control.node == node)
+                .map(|control| control.kind),
+        });
+    let match_author = search
+        .current_match()
+        .and_then(|node| viewport::author_id(view.document(), node));
+    ReloadState {
+        anchor,
+        open_details,
+        focus,
+        match_author,
+    }
+}
+
+fn open_details_ids(document: &BaseDocument) -> Vec<String> {
+    document
+        .tree()
+        .iter()
+        .filter_map(|(_, node)| {
+            let element = node.element_data()?;
+            let local: &str = element.name.local.as_ref();
+            if local != "details" || !node.data.has_attr(local_name!("open")) {
+                return None;
+            }
+            viewport::own_id(node).map(str::to_owned)
+        })
+        .collect()
+}
+
+fn restore_open_details(view: &mut DocViewport, ids: &[String]) {
+    let mut opened = false;
+    for id in ids {
+        let Some(node) = view.document().get_element_by_id(id) else {
+            continue;
+        };
+        let is_details = view
+            .document()
+            .get_node(node)
+            .and_then(|node| node.element_data())
+            .is_some_and(|element| {
+                let local: &str = element.name.local.as_ref();
+                local == "details"
+            });
+        if !is_details {
+            continue;
+        }
+        let already_open = view
+            .document()
+            .get_node(node)
+            .is_some_and(|node| node.data.has_attr(local_name!("open")));
+        if !already_open {
+            view.document_mut().toggle_details_open(node);
+            opened = true;
+        }
+    }
+    if opened {
+        view.resolve();
+    }
+}
+
+fn restore_focus(view: &mut DocViewport, focus: Option<&FocusPoint>) {
+    let Some(focus) = focus else {
+        return;
+    };
+    view.resolve();
+    let controls = navigation::controls(view.document());
+    let by_id = focus.author.as_deref().and_then(|author| {
+        let node = view.document().get_element_by_id(author)?;
+        controls
+            .iter()
+            .any(|control| control.node == node)
+            .then_some(node)
+    });
+    let by_index = focus.index.and_then(|index| {
+        controls
+            .get(index)
+            .filter(|control| Some(control.kind) == focus.kind)
+            .map(|control| control.node)
+    });
+    if let Some(node) = by_id.or(by_index) {
+        view.document_mut().set_focus_to(node);
+    }
+}
+
+fn geometry_viewport(geometry: ViewGeometry) -> BlitzViewport {
+    let (width, height) = geometry.physical_size();
+    BlitzViewport::new(width, height, geometry.scale() as f32, ColorScheme::Dark)
+}
+
+fn reload_ingest_error(err: &IngestError) -> String {
+    let reason = match err {
+        IngestError::Read(io) if io.kind() == io::ErrorKind::NotFound => "file missing",
+        IngestError::Read(_) => "cannot read file",
+        IngestError::TooLarge { .. } => "file too large",
+        IngestError::InvalidUtf8 { .. } => "file is not UTF-8",
+        IngestError::NodeBudget { .. } | IngestError::DepthBudget { .. } => "document too complex",
+    };
+    format!("reload: {reason} (keeping previous report)")
+}
+
 fn run_pager(
     args: &Args,
     ingested: IngestedDocument,
+    baseline: Option<watch::Baseline>,
     mut owner: TerminalOwner,
     started: Instant,
 ) -> Result<(), String> {
     let geometry = owner.geometry();
     let (width, height) = geometry.physical_size();
     let mut pager = Pager::new(ingested.document, width, height, geometry.scale());
+    match baseline {
+        Some(baseline) if wants_watch(args) => {
+            pager.watcher = Some(watch::Watcher::new(&args.input, baseline));
+            pager.metrics.push("watch", "on");
+        }
+        _ => pager.metrics.push("watch", "off"),
+    }
     pager.metrics.push("mode", "live");
     pager.metrics.push("placement", owner.placement_name());
     pager
@@ -1171,5 +1441,70 @@ mod tests {
         assert!(check_viewport(840, 1800).is_ok());
         assert!(check_viewport(0, 10).is_err());
         assert!(check_viewport(4000, 4000).is_err());
+    }
+
+    #[test]
+    fn reload_state_maps_details_and_focus_by_author_id() {
+        use blitz_dom::DocumentConfig;
+        use blitz_html::HtmlDocument;
+
+        let html = concat!(
+            "<!doctype html><style>body{font:16px monospace}</style>",
+            "<a id=\"jump\" href=\"#target\">Jump</a>",
+            "<details id=\"evidence\"><summary>Evidence</summary><p id=\"target\">Body</p></details>"
+        );
+        let mut document = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(text_viewport()),
+                ..Default::default()
+            },
+        )
+        .into_inner();
+        document.resolve(0.0);
+        let mut view = DocViewport::new(document, TEXT_VIEWPORT_WIDTH, TEXT_VIEWPORT_HEIGHT, 1.0);
+        let jump = view
+            .document()
+            .get_element_by_id("jump")
+            .expect("fixture link");
+        view.document_mut().set_focus_to(jump);
+        let details = view
+            .document()
+            .get_element_by_id("evidence")
+            .expect("fixture details");
+        view.document_mut().toggle_details_open(details);
+        view.resolve();
+        let state = capture_reload_state(&mut view, &Search::new());
+        assert_eq!(state.open_details, vec!["evidence".to_string()]);
+
+        // Same author ids in a fresh document produce fresh DOM-local NodeIds.
+        let mut document = HtmlDocument::from_html(
+            html,
+            DocumentConfig {
+                viewport: Some(text_viewport()),
+                ..Default::default()
+            },
+        )
+        .into_inner();
+        document.resolve(0.0);
+        let mut candidate =
+            DocViewport::new(document, TEXT_VIEWPORT_WIDTH, TEXT_VIEWPORT_HEIGHT, 1.0);
+        restore_open_details(&mut candidate, &state.open_details);
+        restore_focus(&mut candidate, state.focus.as_ref());
+
+        let details = candidate
+            .document()
+            .get_element_by_id("evidence")
+            .expect("reloaded details");
+        let open = candidate
+            .document()
+            .get_node(details)
+            .is_some_and(|node| node.data.has_attr(local_name!("open")));
+        assert!(open, "disclosure id did not retain its open state");
+        let focus = candidate
+            .document()
+            .get_focussed_node_id()
+            .and_then(|node| viewport::author_id(candidate.document(), node));
+        assert_eq!(focus.as_deref(), Some("jump"));
     }
 }

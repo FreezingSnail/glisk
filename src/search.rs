@@ -215,6 +215,53 @@ impl Search {
         self.status.clone()
     }
 
+    /// Rebuild matches after the viewport swapped to a reloaded document.
+    ///
+    /// The committed query is preserved. When `previous_author` names the
+    /// previous current match's author id and that id still anchors a new
+    /// match, the same document location stays selected. Otherwise the old
+    /// ordinal is clamped to the new match list. This never reveals or scrolls,
+    /// so the restored reading section stays put.
+    pub fn remap(
+        &mut self,
+        text: &DocumentText,
+        viewport: &mut Viewport,
+        previous_author: Option<String>,
+    ) {
+        if self.query.is_empty() {
+            self.matches.clear();
+            self.current = None;
+            return;
+        }
+        let previous = self.current;
+        self.matches = text
+            .matching_blocks(&self.query)
+            .map(|block| block.node)
+            .collect();
+        if self.matches.is_empty() {
+            self.current = None;
+            if !self.editing {
+                self.status = SearchStatus::NoMatches {
+                    query: self.query.clone(),
+                };
+            }
+            return;
+        }
+        let mapped = previous_author.and_then(|author| {
+            self.matches.iter().position(|node| {
+                crate::viewport::author_id(viewport.document(), *node).as_deref()
+                    == Some(author.as_str())
+            })
+        });
+        let index = mapped
+            .or_else(|| previous.map(|index| index.min(self.matches.len() - 1)))
+            .unwrap_or(0);
+        self.current = Some(index);
+        if !self.editing {
+            self.update_match_status();
+        }
+    }
+
     /// Escape: close the prompt, discard the edit buffer, and retain the prior
     /// query, matches, current position, and status.
     pub fn cancel(&mut self) -> SearchStatus {

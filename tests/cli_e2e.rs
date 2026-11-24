@@ -21,10 +21,7 @@ use std::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_glisk");
-const FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/examples/decision-report.html"
-);
+const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/decision-report.html");
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 
 static PTY_LOCK: Mutex<()> = Mutex::new(());
@@ -83,7 +80,10 @@ fn animated_example_text_keeps_the_visual_explanation() {
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_plain(&output.stdout);
     let text = String::from_utf8(output.stdout).expect("UTF-8");
-    assert!(text.contains("Top: cache hit. Request → response."), "{text}");
+    assert!(
+        text.contains("Top: cache hit. Request → response."),
+        "{text}"
+    );
     assert!(
         text.contains("Bottom: cache miss. Request → origin → response."),
         "{text}"
@@ -590,6 +590,21 @@ impl PtyRun {
         false
     }
 
+    fn graphics_frames(&self) -> usize {
+        self.capture.count(b"\x1b_Ga=")
+    }
+
+    fn wait_for_graphics_after(&self, previous: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.graphics_frames() > previous {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
@@ -643,6 +658,150 @@ fn describe_capture(capture: &Capture) -> String {
         bytes.len(),
         String::from_utf8_lossy(&bytes[tail_start..])
     )
+}
+
+struct WatchedReport {
+    path: std::path::PathBuf,
+}
+
+impl WatchedReport {
+    fn new(name: &str, html: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "glisk-watch-{}-{stamp}-{name}.html",
+            std::process::id()
+        ));
+        std::fs::write(&path, html).expect("write watched report");
+        Self { path }
+    }
+
+    fn path(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    fn write(&self, html: &str) {
+        std::fs::write(&self.path, html).expect("rewrite watched report");
+    }
+
+    fn replace_atomically(&self, html: &str) {
+        let temporary = self.path.with_extension("replacement");
+        std::fs::write(&temporary, html).expect("write replacement");
+        std::fs::rename(&temporary, &self.path).expect("atomic replacement");
+    }
+}
+
+impl Drop for WatchedReport {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("replacement"));
+    }
+}
+
+fn watch_html(marker: &str) -> String {
+    format!(
+        "<!doctype html><html><head><style>
+         html, body {{ margin: 0; padding: 0; background: #fff; color: #000; }}
+         body {{ font: 16px/24px monospace; }}
+         section {{ min-height: 240px; }}
+         </style></head><body>
+         <h1 id=\"watch-top\">Watched report</h1>
+         <section id=\"watch-first\"><p>{marker}</p></section>
+         <section id=\"watch-last\"><p>Closing section.</p></section>
+         </body></html>"
+    )
+}
+
+#[test]
+fn live_pager_follows_save_atomic_replace_and_recreation() {
+    let report = WatchedReport::new("follow", &watch_html("alpha revision"));
+    let path = report.path();
+    let mut run = PtyRun::spawn(&[&path], None, ProbeReply::GraphicsOk, "xterm-ghostty");
+    let timeout = Duration::from_secs(6);
+    assert!(
+        run.wait_for(b"\x1b[?1049h", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+
+    let first = run.graphics_frames();
+    report.write(&watch_html("beta revision"));
+    assert!(
+        run.wait_for_graphics_after(first, timeout),
+        "normal save did not reload: {}",
+        describe_capture(&run.capture)
+    );
+
+    let replaced = run.graphics_frames();
+    report.replace_atomically(&watch_html("gamma revision"));
+    assert!(
+        run.wait_for_graphics_after(replaced, timeout),
+        "atomic replacement did not reload: {}",
+        describe_capture(&run.capture)
+    );
+
+    let missing = run.graphics_frames();
+    std::fs::remove_file(&report.path).expect("remove watched report");
+    assert!(
+        run.wait_for(b"reload: file missing", timeout),
+        "missing replacement did not show status: {}",
+        describe_capture(&run.capture)
+    );
+    assert!(
+        run.wait_for_graphics_after(missing, timeout),
+        "missing branch must repaint the retained report and status"
+    );
+
+    let failed = run.graphics_frames();
+    report.write(&watch_html("recovered revision"));
+    assert!(
+        run.wait_for_graphics_after(failed, timeout),
+        "recreation did not recover: {}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
+    assert!(run.wait_for(b"\x1b[?1049l", timeout));
+    assert!(run.stderr().is_empty());
+}
+
+#[test]
+fn live_pager_no_watch_holds_the_original_revision() {
+    let report = WatchedReport::new("snapshot", &watch_html("snapshot revision"));
+    let path = report.path();
+    let mut run = PtyRun::spawn(
+        &[&path, "--no-watch"],
+        None,
+        ProbeReply::GraphicsOk,
+        "xterm-ghostty",
+    );
+    let timeout = Duration::from_secs(5);
+    assert!(
+        run.wait_for(b"\x1b_Ga=T", timeout),
+        "{}",
+        describe_capture(&run.capture)
+    );
+    let first = run.graphics_frames();
+    report.write(&watch_html("ignored revision"));
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        run.graphics_frames(),
+        first,
+        "--no-watch must not follow the file: {}",
+        describe_capture(&run.capture)
+    );
+
+    run.keys(b"q");
+    assert!(run.wait_exit(timeout).success());
+    assert!(run.stderr().is_empty());
 }
 
 #[test]
