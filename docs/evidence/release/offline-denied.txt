@@ -1,0 +1,15 @@
+# Offline denial fixture
+
+This readable body must survive every denied external resource. Glisk does not fetch the stylesheet, font, images, iframe, or link targets.
+
+[image: Blocked external chart (alt text stays readable)]
+
+[image: Blocked file image]
+
+Local section External link
+
+Local disclosure
+
+Searchable text inside a closed disclosure. Fragment jumps and Enter open this body.
+
+End of the readable offline document.

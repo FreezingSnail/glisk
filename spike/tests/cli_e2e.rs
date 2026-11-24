@@ -1,6 +1,6 @@
 //! End-to-end CLI tests for the wired Glisk pager.
 //!
-//! These spawn the real `glisk-spike` binary. Plain-output tests use ordinary
+//! These spawn the real `glisk` binary. Plain-output tests use ordinary
 //! pipes. Live tests allocate a PTY, emulate the bounded Kitty/CSI probe, drive
 //! keys through the same terminal, and check the cleanup sequence.
 
@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_glisk-spike");
+const BIN: &str = env!("CARGO_BIN_EXE_glisk");
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../examples/decision-report.html"
@@ -176,6 +176,44 @@ fn oversized_stdin_exits_1_without_waiting_for_layout() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cap"), "{stderr}");
+}
+
+#[test]
+fn version_uses_user_facing_name() {
+    let output = command(&["--version"]).output().expect("run");
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+    assert!(stdout.starts_with("glisk "), "{stdout}");
+}
+
+#[test]
+fn scroll_sweep_keeps_viewport_sized_frames() {
+    let output = command(&[
+        FIXTURE,
+        "--scroll-sweep",
+        "--css-width",
+        "420",
+        "--css-height",
+        "900",
+        "--scale",
+        "2",
+    ])
+    .output()
+    .expect("run");
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8");
+    assert!(
+        stderr.contains("max raster 1512000px"),
+        "sweep summary: {stderr}"
+    );
+    let frames: u32 = stderr
+        .split("scroll sweep ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("frame count: {stderr}"));
+    assert!(frames > 1, "multi-screen fixture painted {frames} frame(s)");
 }
 
 #[test]

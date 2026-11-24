@@ -92,6 +92,10 @@ Treat these caps as starting values. Use the prototype to check they fit the ref
 
 ### Verification and release evidence
 
+Release scope, packaged artifact hashes, reproduced CLI/PTY/live-Ghostty
+measurements, and unresolved OS-level checks are recorded in `docs/release.md`.
+The table below remains the release checklist.
+
 | Check | Evidence |
 |---|---|
 | Reference report | Ghostty screenshots at a narrow and a wide width, the exact macOS/Ghostty versions and display scale, and a walkthrough of navigation, disclosure, search, resize, and shell restoration. |

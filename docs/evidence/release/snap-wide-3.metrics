@@ -1,0 +1,9 @@
+mode=snapshot
+css_width=1000
+css_height=900
+scale=2
+physical_width=2000
+physical_height=1800
+png_bytes=421477
+cold_start_to_png_ms=91.4
+peak_rss_bytes=43433984

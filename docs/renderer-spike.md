@@ -168,7 +168,7 @@ Raw samples: `docs/evidence/snapshot-samples.txt` and `snap-*.metrics`.
 ### Binary
 
 ```
--rwxr-xr-x  12,993,648 bytes  spike/target/release/glisk-spike   (12.39 MiB)
+-rwxr-xr-x  13,057,872 bytes  spike/target/release/glisk   (12.45 MiB)
 ```
 
 Built with `strip = true`, `lto = "thin"`, `codegen-units = 1`.
@@ -219,11 +219,11 @@ cargo build --release
 Headless frame, narrow and wide:
 
 ```sh
-./target/release/glisk-spike ../examples/decision-report.html \
+./target/release/glisk ../examples/decision-report.html \
   --snapshot ../docs/evidence/narrow-chart.png \
   --css-width 420 --css-height 900 --scale 2 --fragment chart
 
-./target/release/glisk-spike ../examples/decision-report.html \
+./target/release/glisk ../examples/decision-report.html \
   --snapshot ../docs/evidence/wide-chart.png \
   --css-width 1000 --css-height 900 --scale 2 --fragment chart
 ```
@@ -232,15 +232,15 @@ Headless interaction/resize assertions (anchor scroll, disclosure open, focus an
 state retained across viewport change):
 
 ```sh
-./target/release/glisk-spike ../examples/decision-report.html --self-test \
+./target/release/glisk ../examples/decision-report.html --self-test \
   --metrics ../docs/evidence/self-test.metrics
 ```
 
 Live Ghostty window with deterministic scripted actions and frame dumps:
 
 ```sh
-open -na Ghostty.app --args --font-size=14 --title=glisk-spike \
-  -e "$PWD/spike/target/release/glisk-spike" \
+open -na Ghostty.app --args --font-size=14 --window-width=46 --window-height=17 --title=glisk \
+  -e "$PWD/spike/target/release/glisk" \
      "$PWD/examples/decision-report.html" \
      --scripted-actions \
      --dump-dir "$PWD/docs/evidence/ghostty-live" \
@@ -248,13 +248,14 @@ open -na Ghostty.app --args --font-size=14 --title=glisk-spike \
 ```
 
 Replacing `--font-size=14` with 14 / 16 / 22 changes the cell grid and therefore the
-CSS width. `--window-width` / `--window-height` did **not** change the grid in this
-environment. Resize the window manually for a true resize test.
+CSS width. On this build `--window-width` / `--window-height` are terminal cells, so
+`46` / `17` reproduces the narrow grid; earlier point-sized attempts did not produce a
+predictable grid. Resize the window manually for a true resize test.
 
 Interactive manual check (required for acceptance on another machine):
 
 ```sh
-./spike/target/release/glisk-spike examples/decision-report.html
+./spike/target/release/glisk examples/decision-report.html
 ```
 
 1. `Tab` / `Shift+Tab`: focus moves through nav links and both summaries, with a
@@ -269,7 +270,7 @@ Interactive manual check (required for acceptance on another machine):
 Pseudo-terminal framing check:
 
 ```sh
-script -q /dev/null spike/target/release/glisk-spike \
+script -q /dev/null spike/target/release/glisk \
   examples/decision-report.html --once \
   --metrics docs/evidence/pty-live.metrics
 ```
@@ -288,7 +289,7 @@ script -q /dev/null spike/target/release/glisk-spike \
 | Keyboard disclosure activation | **Not verified with OS keys** | scripted `Toggle` renders live frame 010; headless self-test asserts `open` |
 | Resize retains state | **Not verified live** | headless self-test asserts disclosure and focus survive a 420→1000 CSS viewport change; scroll offset retained, semantic re-anchor unimplemented |
 | Shell restoration | **Partially verified** | pty capture shows alternate-screen leave/delete; live windows were launched with `-e`, so no shell prompt was observed |
-| Binary size | **Verified** | 12,993,648 bytes |
+| Binary size | **Verified** | 13,057,872 bytes (release build at bead `glisk-2hp.9`) |
 | Cold startup → frame write | **Verified** | 138.5 ms narrow, 186.5 ms wide observed |
 | Key → frame write | **Scripted only** | 7.7 ms mean narrow, 49.4 ms mean wide observed |
 | Peak memory | **Verified narrow** | 29,048,832 B live; 34.0/43.3 MB headless narrow/wide |

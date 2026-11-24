@@ -36,7 +36,7 @@ const TEXT_VIEWPORT_WIDTH: u32 = 420;
 const TEXT_VIEWPORT_HEIGHT: u32 = 900;
 
 #[derive(Parser, Debug)]
-#[command(about = "Glisk HTML pager", version)]
+#[command(name = "glisk", about = "Glisk HTML pager", version)]
 struct Args {
     /// Local .htm/.html file, or `-` to read the document from stdin.
     input: String,
@@ -85,6 +85,11 @@ struct Args {
     #[arg(long, hide = true)]
     self_test: bool,
 
+    /// Diagnostic: paint every page from top to bottom and record the largest
+    /// raster and encoded frame (release memory evidence for long reports).
+    #[arg(long, hide = true)]
+    scroll_sweep: bool,
+
     /// Diagnostic: write every live PNG frame into this directory.
     #[arg(long, hide = true)]
     dump_dir: Option<String>,
@@ -100,6 +105,8 @@ fn main() {
 
     let result = if args.self_test {
         self_test(&args, started)
+    } else if args.scroll_sweep {
+        scroll_sweep(&args, started)
     } else if let Some(path) = &args.snapshot {
         snapshot(&args, path, started)
     } else {
@@ -778,6 +785,66 @@ fn snapshot(args: &Args, path: &str, started: Instant) -> Result<(), String> {
         "glisk: snapshot {width}x{height}px {} bytes in {:.1} ms -> {path}",
         png.len(),
         elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+/// Full-page sweep: paint one viewport-sized frame per page from the top to the
+/// bottom of the document. Every frame reuses the same geometry, so the largest
+/// raster and encoded frame show whether memory tracks the viewport or document
+/// length. Release evidence in `docs/release.md` uses this for long reports.
+fn scroll_sweep(args: &Args, started: Instant) -> Result<(), String> {
+    let width = (args.css_width * args.scale).round() as u32;
+    let height = (args.css_height * args.scale).round() as u32;
+    check_viewport(width, height)?;
+    let ingested = ingest_source(
+        &args.input,
+        BlitzViewport::new(width, height, args.scale as f32, ColorScheme::Dark),
+    )?;
+    let mut metrics = Metrics::new();
+    metrics.push("mode", "scroll-sweep");
+    metrics.push("css_width", &args.css_width.to_string());
+    metrics.push("css_height", &args.css_height.to_string());
+    metrics.push("scale", &args.scale.to_string());
+    metrics.push("physical_width", &width.to_string());
+    metrics.push("physical_height", &height.to_string());
+    metrics.push("document_nodes", &ingested.stats.nodes.to_string());
+
+    let mut view = DocViewport::new(ingested.document, width, height, args.scale);
+    let mut frames = 0u32;
+    let mut max_png = 0usize;
+    let mut max_raster = 0u64;
+    let mut last_scroll = 0.0;
+    let mut skipped = 0u32;
+    loop {
+        match view
+            .paint()
+            .map_err(|err| format!("cannot paint viewport: {err}"))?
+        {
+            PaintOutcome::Frame(frame) => {
+                frames += 1;
+                max_png = max_png.max(frame.png.len());
+                max_raster = max_raster.max(frame.pixels);
+                last_scroll = frame.scroll_y;
+            }
+            PaintOutcome::Skipped(_) => skipped += 1,
+        }
+        if !view.scroll_page(1.0) {
+            break;
+        }
+    }
+
+    metrics.push("frames", &frames.to_string());
+    metrics.push("skipped_frames", &skipped.to_string());
+    metrics.push("max_png_bytes", &max_png.to_string());
+    metrics.push("max_raster_pixels", &max_raster.to_string());
+    metrics.push("final_scroll_y", &format!("{last_scroll:.1}"));
+    metrics.push("max_scroll_y", &format!("{:.1}", view.max_scroll()));
+    metrics.push("cold_start_to_sweep_end_ms", &format_ms(started.elapsed()));
+    note_rss(&mut metrics);
+    metrics.write(args.metrics.as_deref())?;
+    eprintln!(
+        "glisk: scroll sweep {frames} frames, max raster {max_raster}px, max PNG {max_png} B"
     );
     Ok(())
 }

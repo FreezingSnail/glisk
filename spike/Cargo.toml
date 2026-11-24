@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.91"
 publish = false
 
+[[bin]]
+name = "glisk"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.22.1"
 blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "system-fonts", "woff", "text-transform-icu"] }

@@ -45,12 +45,31 @@ owner.
 
 ## Hidden diagnostic flags
 
-`--snapshot`, `--self-test`, `--scripted-actions`, `--once`, `--dump-dir`,
-`--metrics`, `--fragment`, `--toggle`, `--focus`, `--css-width`,
+`--snapshot`, `--self-test`, `--scripted-actions`, `--scroll-sweep`, `--once`,
+`--dump-dir`, `--metrics`, `--fragment`, `--toggle`, `--focus`, `--css-width`,
 `--css-height`, and `--scale` remain hidden for the renderer evidence in
-`docs/renderer-spike.md`. They use the same bounded ingestion path. The old
-`--cell-width-px` / `--cell-height-px` fallback was removed with the terminal
-owner; a missing cell measurement selects plain text.
+`docs/renderer-spike.md` and `docs/release.md`. They use the same bounded
+ingestion path. `--scroll-sweep` paints every page from the top to the end and
+records the largest raster/encoded frame, so a long report can be checked for
+viewport-bounded memory. The old `--cell-width-px` / `--cell-height-px`
+fallback was removed with the terminal owner; a missing cell measurement selects
+plain text.
+
+## Build and package
+
+The Cargo package remains `glisk-spike` in `spike/`, but the only binary is
+named `glisk` (`[[bin]]` in `spike/Cargo.toml`). Build and assemble the local
+macOS bundle from the pinned lockfile:
+
+```sh
+./scripts/package-macos.sh
+```
+
+That runs `cargo build --release --locked --manifest-path spike/Cargo.toml`,
+writes `dist/glisk`, and creates a deterministic
+`dist/glisk-v0-macos-<arch>.tar.gz` with the example, authoring guide, CLI doc,
+and checksums. Artifacts are ignored by git; the procedure and sources are
+checked in.
 
 ## Tests
 

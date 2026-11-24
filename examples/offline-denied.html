@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Offline denial fixture</title>
+<link rel="stylesheet" href="https://example.invalid/report.css">
+<style>
+  @import url("https://example.invalid/import.css");
+  @font-face { font-family: "Blocked"; src: url("https://example.invalid/blocked.woff2"); }
+  :root { color-scheme: dark; --bg:#0f1419; --card:#1b2430; --line:#3b4d60;
+          --ink:#e8eef5; --muted:#a9b8c8; --accent:#71d6a8; }
+  html { background: var(--bg); color: var(--ink); }
+  body { margin:0; padding:24px 20px; font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
+         font-size:16px; line-height:1.45; background:var(--bg); color:var(--ink); }
+  main { max-width:760px; margin:0 auto; }
+  h1 { font-size:27px; margin:0 0 10px; }
+  p { color:var(--muted); margin:0 0 10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 15px; margin:0 0 14px; }
+  .card p { margin:0; }
+  a { color:var(--accent); }
+  a:focus, summary:focus { outline:3px solid var(--accent); outline-offset:2px; }
+  details { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:0 14px 2px; margin:0 0 14px; }
+  summary { cursor:pointer; padding:10px 0; color:var(--accent); font-weight:700; }
+</style>
+</head>
+<body>
+<main>
+<h1>Offline denial fixture</h1>
+<p>This readable body must survive every denied external resource. Glisk does not fetch the stylesheet, font, images, iframe, or link targets.</p>
+<div class="card">
+  <img src="https://example.invalid/chart.png" alt="Blocked external chart (alt text stays readable)">
+  <img src="file:///etc/passwd" alt="Blocked file image">
+</div>
+<nav aria-label="Local navigation"><a href="#local">Local section</a> <a href="https://example.invalid/away">External link</a></nav>
+<details id="local"><summary>Local disclosure</summary><p>Searchable text inside a closed disclosure. Fragment jumps and Enter open this body.</p></details>
+<iframe src="https://example.invalid/frame.html" title="Blocked frame">Blocked iframe fallback text.</iframe>
+<script>document.body.textContent = "script must not run";</script>
+<p>End of the readable offline document.</p>
+</main>
+</body>
+</html>

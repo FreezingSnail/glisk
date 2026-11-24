@@ -1,0 +1,15 @@
+mode=scroll-sweep
+css_width=1000
+css_height=900
+scale=2
+physical_width=2000
+physical_height=1800
+document_nodes=378
+frames=3
+skipped_frames=0
+max_png_bytes=421477
+max_raster_pixels=3600000
+final_scroll_y=1022.0
+max_scroll_y=1022.0
+cold_start_to_sweep_end_ms=211.3
+peak_rss_bytes=43581440

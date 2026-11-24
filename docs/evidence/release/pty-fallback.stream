@@ -1,0 +1,86 @@
+^D[16t_Gi=31,a=q,t=d,f=24,s=1,v=1;AAAA\glisk: graphics unavailable: terminal probe timeout: no probe replies before deadline; using plain text
+# Glisk renderer decision report
+
+Which renderer should power a live HTML pager inside Ghostty? This report compares the v0 candidates and records the evidence needed before the viewer is built around one engine.
+
+Decision report Ghostty 1.4+ macOS No JavaScript
+
+Fixture for bead glisk-2hp.1 · author: Glisk spike · status: prototype
+
+Summary Comparison Startup chart Evidence Risks
+
+## Summary
+
+### Recommended path
+
+Blitz with the Vello CPU rasterizer keeps the document model and the renderer in one Rust process. That is the only candidate that can preserve disclosure and focus state while reflowing on terminal resize.
+
+One
+
+### Viewport-sized image
+
+The terminal receives one Kitty image placement per redraw. The raster stays at viewport size even when the document is many screens tall.
+
+Offline
+
+### Resource policy
+
+The document gets its own HTML and embedded assets. Network fetches, secondary files, and navigation away from the document are denied before layout.
+
+Decision: continue with Blitz + Vello CPU only if the pinned build renders the cards, the headered table, and the inline SVG chart at both tested widths and survives keyboard interaction and resize. The measurements below are the comparison baseline.
+
+## Comparison
+
+Candidate renderers for the Glisk v0 pager. Lower startup is better; fidelity is judged on the reference report.
+| Option | Layout fidelity | Weight and latency | Verdict |
+| Blitz + Vello CPU | Embedded HTML/CSS, flex, grid, partial tables, inline SVG | Large Rust binary; CPU raster per frame | Selected for v0 |
+| Headless Chrome | Full browser behavior | External Chrome; about 0.5 s warm and 1.2 s cold for a trivial page | Scripted documents later |
+| Native TUI browser | Own CSS engine, terminal-native text | Medium to heavy; different interaction model | Reference only |
+| HTML to ANSI text | No real CSS layout; text stays selectable | Cheap and fast | Plain-text fallback |
+
+## Startup and redraw budget
+
+Chart: Startup latency comparison. Bar chart of cold startup in milliseconds: Blitz spike target 120, headless Chrome warm 520, headless Chrome cold 1230. A dashed line marks the 250 millisecond target.
+
+Figure 1. Cold startup comparison for the candidate renderers, in milliseconds. The dashed line is the 250 ms interactive target for the spike.
+
+- Blitz must keep cold startup and first frame under the dashed 250 ms target.
+- Headless Chrome warm startup is already above that target by roughly 2x.
+- Cold Chrome startup is about 5x the target and requires a separate browser process.
+- The chart is decorative once the text summary is present; color is not the only encoding.
+
+## Evidence
+
+Evidence 1: how the renderer was exercised
+
+The pinned prototype loads this same file with external fetches denied. It resolves layout at a narrow CSS viewport and at a wide CSS viewport, paints each viewport with Vello CPU, and writes a PNG frame before sending it to the terminal.
+
+- Keyboard: Tab and Shift+Tab move focus; Enter follows a fragment link or toggles the focused disclosure.
+- Resize: geometry is measured again, the viewport is re-laid out, and the reading position, focus, and open disclosures are kept.
+- Exit: the image is deleted, raw mode is disabled, and the alternate screen is left before the shell prompt returns.
+
+Any value not observed in a live Ghostty run is marked unverified in the spike notes instead of being estimated as measured.
+
+Evidence 2: known gaps and resolution conditions
+
+Blitz has no JavaScript and supports only part of the table and overflow model. The report therefore uses flex-wrapped cards, a fixed-layout table, and an inline SVG chart rather than scripted widgets or sticky headers.
+
+- If the headered table paints without header text, the acceptance condition is a pinned Blitz build that paints table headers, or a documented CSS fallback using grid rows.
+- If a narrow viewport clips the table, the condition is a verified alternate layout at the narrow width, not a horizontal scroll assumption.
+- If foreground input or resize replies cannot be separated from keys, the condition is a single owner that buffers replies and keys with a shared deadline.
+
+## Risks
+
+### Rasterized text
+
+Terminal selection and screen readers cannot read an image. Search and a plain-text mode must use the same document walk that produces the report text.
+
+### Geometry
+
+Cell pixels differ by display scale. Measure cell geometry on the target and derive CSS size from measured pixels rather than assuming a Retina factor.
+
+### Payload growth
+
+Keep the raster viewport-sized, cap the encoded frame, and replace one image ID instead of accumulating placements.
+
+Glisk reference fixture · inline CSS, inline SVG, no external assets, no script · reproduce with the commands in docs/renderer-spike.md.
